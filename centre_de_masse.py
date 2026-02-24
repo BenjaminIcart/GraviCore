@@ -203,8 +203,8 @@ web_server_thread = None
 web_server_running = False
 
 # Remote sync (hardcoded — always on)
-_REMOTE_URL = "https://ibenji.fr/plancheadmin/cm_api.php"
-_REMOTE_KEY = "c4d1146e19f391e0b6901bcb88c32d10e7f6e5174d12f179bd7a1018b4c9c8e0"
+_REMOTE_URL = ".../cm_api.php"
+_REMOTE_KEY = ""
 remote_sync = RemoteSync(server_url=_REMOTE_URL, api_key=_REMOTE_KEY,
                          app_version=APP_VERSION)
 
