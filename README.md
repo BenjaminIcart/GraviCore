@@ -166,11 +166,7 @@ plancheadmin/
 | POST    | (sans action)                    | API Key  | Recoit un heartbeat JSON              |
 | POST    | `?action=upload`                 | API Key  | Upload d'un nouveau .exe              |
 
-### Cle API
 
-```
-c4d1146e19f391e0b6901bcb88c32d10e7f6e5174d12f179bd7a1018b4c9c8e0
-```
 
 Configuree dans :
 - `cm_api.php` : `define('API_KEY', '...')`
