@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Centre de Masse — Dashboard{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Sessions enregistrees</h2>
+
+    <div class="filters">
+        <label>Utilisateur:</label>
+        <select id="filter-user" onchange="filterTable()">
+            <option value="">-- Tous --</option>
+            {% for uid, uname in users %}
+            <option value="{{ uname }}">{{ uname }}</option>
+            {% endfor %}
+        </select>
+
+        <label>Plateforme:</label>
+        <select id="filter-platform" onchange="filterTable()">
+            <option value="">-- Toutes --</option>
+            {% for pid, pname, pw, ph in platforms %}
+            <option value="{{ pname }}">{{ pname }}</option>
+            {% endfor %}
+        </select>
+
+        <span id="session-count" style="color: var(--text-dim); font-size: 13px; margin-left: auto;"></span>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Date</th>
+                <th>Utilisateur</th>
+                <th>Plateforme</th>
+                <th>Duree</th>
+                <th>Samples</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody id="session-tbody">
+            {% for s in sessions %}
+            <tr data-user="{{ s.user_name or '' }}" data-platform="{{ s.platform_name or '' }}">
+                <td>{{ s.id }}</td>
+                <td>{{ s.started_at }}</td>
+                <td><span class="badge badge-blue">{{ s.user_name or '?' }}</span></td>
+                <td><span class="badge badge-green">{{ s.platform_name or '?' }}</span></td>
+                <td>
+                    {% if s.duration_sec %}
+                        {% if s.duration_sec >= 60 %}
+                            {{ (s.duration_sec // 60)|int }}m {{ (s.duration_sec % 60)|int }}s
+                        {% else %}
+                            {{ "%.1f"|format(s.duration_sec) }}s
+                        {% endif %}
+                    {% else %}
+                        --
+                    {% endif %}
+                </td>
+                <td>{{ s.sample_count or 0 }}</td>
+                <td>
+                    <a href="/replay/{{ s.id }}" class="btn btn-blue">Relecture</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    {% if not sessions %}
+    <p style="text-align: center; color: var(--text-dim); padding: 20px;">
+        Aucune session enregistree pour le moment.
+    </p>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function filterTable() {
+    const userFilter = document.getElementById('filter-user').value;
+    const platFilter = document.getElementById('filter-platform').value;
+    const rows = document.querySelectorAll('#session-tbody tr');
+    let visible = 0;
+    rows.forEach(row => {
+        const u = row.dataset.user;
+        const p = row.dataset.platform;
+        const show = (!userFilter || u === userFilter) &&
+                     (!platFilter || p === platFilter);
+        row.style.display = show ? '' : 'none';
+        if (show) visible++;
+    });
+    document.getElementById('session-count').textContent = visible + ' session(s)';
+}
+filterTable();
+</script>
+{% endblock %}

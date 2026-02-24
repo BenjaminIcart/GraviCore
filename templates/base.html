@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Centre de Masse{% endblock %}</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --bg-card: #1e293b;
+            --accent-blue: #38bdf8;
+            --accent-teal: #2dd4bf;
+            --accent-green: #4ade80;
+            --accent-amber: #fbbf24;
+            --accent-red: #fb7185;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-dim: #475569;
+            --border: #334155;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 16px 0; border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+        .header h1 { color: var(--accent-blue); font-size: 24px; }
+        .header a { color: var(--text-secondary); text-decoration: none; font-size: 14px; }
+        .header a:hover { color: var(--accent-blue); }
+        .card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 16px; margin-bottom: 16px;
+        }
+        .card h2 { color: var(--accent-teal); font-size: 16px; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left; padding: 8px 12px; color: var(--text-secondary);
+            font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 10px 12px; border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+        tr:hover td { background: rgba(56, 189, 248, 0.05); }
+        .btn {
+            display: inline-block; padding: 6px 14px; border-radius: 6px;
+            text-decoration: none; font-size: 13px; font-weight: 600;
+            cursor: pointer; border: none; transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn-blue { background: var(--accent-blue); color: var(--bg); }
+        .btn-teal { background: var(--accent-teal); color: var(--bg); }
+        .filters {
+            display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+        .filters select, .filters input {
+            background: var(--bg); color: var(--text-primary);
+            border: 1px solid var(--border); border-radius: 6px;
+            padding: 6px 10px; font-size: 13px;
+        }
+        .filters label { color: var(--text-secondary); font-size: 13px; }
+        .badge {
+            display: inline-block; padding: 2px 8px; border-radius: 10px;
+            font-size: 11px; font-weight: 600;
+        }
+        .badge-blue { background: rgba(56, 189, 248, 0.2); color: var(--accent-blue); }
+        .badge-green { background: rgba(74, 222, 128, 0.2); color: var(--accent-green); }
+        @media (max-width: 768px) {
+            .container { padding: 12px; }
+            td, th { padding: 6px 8px; font-size: 12px; }
+        }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Centre de Masse</h1>
+            <div>
+                <a href="/">Accueil</a>
+            </div>
+        </div>
+        {% block content %}{% endblock %}
+    </div>
+    {% block extra_scripts %}{% endblock %}
+</body>
+</html>

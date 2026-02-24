@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Relecture — Session #{{ session.id }}{% endblock %}
+
+{% block extra_head %}
+<style>
+    .replay-container {
+        display: flex; gap: 16px; height: calc(100vh - 200px);
+        min-height: 400px;
+    }
+    .replay-sidebar {
+        width: 220px; flex-shrink: 0;
+        display: flex; flex-direction: column; gap: 8px;
+    }
+    .replay-main { flex: 1; display: flex; flex-direction: column; }
+    .replay-canvas-wrap {
+        flex: 1; position: relative;
+        background: var(--bg-card); border: 1px solid var(--border);
+        border-radius: 8px; overflow: hidden;
+    }
+    #replayCanvas { width: 100%; height: 100%; display: block; }
+    .controls {
+        display: flex; align-items: center; gap: 8px; padding: 10px 0;
+        flex-wrap: wrap;
+    }
+    .controls .btn { padding: 8px 16px; font-size: 14px; }
+    .speed-btns { display: flex; gap: 4px; }
+    .speed-btns button {
+        background: var(--bg-card); color: var(--text-secondary);
+        border: 1px solid var(--border); border-radius: 4px;
+        padding: 4px 8px; font-size: 12px; cursor: pointer;
+    }
+    .speed-btns button.active {
+        background: var(--accent-blue); color: var(--bg);
+        border-color: var(--accent-blue);
+    }
+    #timeline {
+        flex: 1; min-width: 100px; height: 6px;
+        -webkit-appearance: none; appearance: none;
+        background: var(--border); border-radius: 3px; cursor: pointer;
+    }
+    #timeline::-webkit-slider-thumb {
+        -webkit-appearance: none; width: 14px; height: 14px;
+        background: var(--accent-blue); border-radius: 50%; cursor: pointer;
+    }
+    .sensor-card {
+        background: var(--bg-card); border-radius: 6px; padding: 8px 10px;
+        display: flex; justify-content: space-between; align-items: center;
+    }
+    .sensor-name { font-size: 11px; font-weight: 600; }
+    .sensor-val { font-family: 'Consolas', monospace; font-size: 14px; font-weight: bold; }
+    .total-card {
+        background: var(--bg-card); border: 2px solid var(--accent-blue);
+        border-radius: 6px; padding: 10px; text-align: center;
+    }
+    .total-val {
+        font-family: 'Consolas', monospace; font-size: 18px;
+        font-weight: bold; color: var(--accent-blue);
+    }
+    .info-row { font-size: 12px; color: var(--text-dim); text-align: center; }
+    .coord-display {
+        font-family: 'Consolas', monospace; font-size: 13px;
+        color: var(--accent-teal); text-align: center; padding: 4px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="card" style="padding: 8px 16px; margin-bottom: 12px;">
+    <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+        <strong style="color: var(--accent-blue);">Session #{{ session.id }}</strong>
+        <span>{{ session.user_name or '?' }}</span>
+        <span style="color: var(--text-dim);">|</span>
+        <span>{{ session.platform_name or '?' }}</span>
+        <span style="color: var(--text-dim);">|</span>
+        <span>{{ session.started_at }}</span>
+        <span style="color: var(--text-dim);">|</span>
+        <span>{{ session.sample_count or 0 }} samples</span>
+        <span style="color: var(--text-dim);">|</span>
+        <span>
+            {% if session.duration_sec %}{{ "%.1f"|format(session.duration_sec) }}s{% else %}--{% endif %}
+        </span>
+    </div>
+</div>
+
+<div class="replay-container">
+    <div class="replay-sidebar">
+        <div class="sensor-card" style="border-left: 3px solid var(--accent-blue);">
+            <span class="sensor-name" style="color: var(--accent-blue);">Haut-Droit</span>
+            <span class="sensor-val" id="w0">0.000 kg</span>
+        </div>
+        <div class="sensor-card" style="border-left: 3px solid var(--accent-red);">
+            <span class="sensor-name" style="color: var(--accent-red);">Haut-Gauche</span>
+            <span class="sensor-val" id="w1">0.000 kg</span>
+        </div>
+        <div class="sensor-card" style="border-left: 3px solid var(--accent-green);">
+            <span class="sensor-name" style="color: var(--accent-green);">Bas-Droit</span>
+            <span class="sensor-val" id="w2">0.000 kg</span>
+        </div>
+        <div class="sensor-card" style="border-left: 3px solid var(--accent-amber);">
+            <span class="sensor-name" style="color: var(--accent-amber);">Bas-Gauche</span>
+            <span class="sensor-val" id="w3">0.000 kg</span>
+        </div>
+        <div class="total-card">
+            <div style="font-size: 11px; color: var(--text-secondary);">TOTAL</div>
+            <div class="total-val" id="total">0.000 kg</div>
+        </div>
+        <div class="coord-display" id="coords">X: 0.0%  Y: 0.0%</div>
+        <div class="info-row" id="timeInfo">0.000 s</div>
+        <div class="info-row" id="frameInfo">0 / 0</div>
+    </div>
+
+    <div class="replay-main">
+        <div class="replay-canvas-wrap">
+            <canvas id="replayCanvas"></canvas>
+        </div>
+        <div class="controls">
+            <button class="btn btn-teal" id="btnPlay" onclick="togglePlay()">PLAY</button>
+            <button class="btn" style="background: var(--bg-card); color: var(--text-secondary); border: 1px solid var(--border);"
+                    onclick="seek(0)">DEBUT</button>
+            <div class="speed-btns">
+                <button onclick="setSpeed(0.25)">0.25x</button>
+                <button onclick="setSpeed(0.5)">0.5x</button>
+                <button onclick="setSpeed(1)" class="active">1x</button>
+                <button onclick="setSpeed(2)">2x</button>
+                <button onclick="setSpeed(4)">4x</button>
+            </div>
+            <input type="range" id="timeline" min="0" max="100" value="0"
+                   oninput="onSlider(this.value)">
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    const SESSION_ID = {{ session.id }};
+    const BOARD_W = {{ board_w }};
+    const BOARD_H = {{ board_h }};
+</script>
+<script src="/static/replay.js"></script>
+{% endblock %}
