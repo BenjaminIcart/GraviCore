@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   Build CentredeMasse.exe (single file)
+echo   Build GraviCore.exe (single file)
 echo ============================================
 echo.
 
@@ -12,22 +12,22 @@ if errorlevel 1 (
 )
 
 :: Clean previous build
-if exist dist\CentredeMasse.exe del /f dist\CentredeMasse.exe
-if exist build\CentredeMasse rmdir /s /q build\CentredeMasse
+if exist dist\GraviCore.exe del /f dist\GraviCore.exe
+if exist build\GraviCore rmdir /s /q build\GraviCore
 
 echo.
 echo [BUILD] Building with PyInstaller...
 echo.
 
-pyinstaller CentredeMasse.spec --noconfirm
+pyinstaller GraviCore.spec --noconfirm
 
 echo.
-if exist dist\CentredeMasse.exe (
+if exist dist\GraviCore.exe (
     echo ============================================
     echo   BUILD OK!
-    echo   dist\CentredeMasse.exe
+    echo   dist\GraviCore.exe
     echo ============================================
-    for %%I in (dist\CentredeMasse.exe) do echo   Size: %%~zI bytes
+    for %%I in (dist\GraviCore.exe) do echo   Size: %%~zI bytes
 ) else (
     echo [ERROR] Build failed. Check errors above.
 )

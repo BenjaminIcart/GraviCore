@@ -56,8 +56,10 @@
                     {% endif %}
                 </td>
                 <td>{{ s.sample_count or 0 }}</td>
-                <td>
+                <td style="display: flex; gap: 4px; align-items: center;">
                     <a href="/replay/{{ s.id }}" class="btn btn-blue">Relecture</a>
+                    <a href="/api/session/{{ s.id }}/export/csv" class="btn" style="background: var(--accent-teal); color: var(--bg); font-size: 11px; padding: 4px 8px;">CSV</a>
+                    <a href="/api/session/{{ s.id }}/export/txt" class="btn" style="background: var(--accent-teal); color: var(--bg); font-size: 11px; padding: 4px 8px;">TXT</a>
                 </td>
             </tr>
             {% endfor %}

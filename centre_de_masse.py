@@ -1,21 +1,19 @@
 # ============================================================
-#  Centre de Masse — Plateforme de Force
-#  pip install pyserial flask
+#  Centre de Masse — Plateforme de Force  (Dear PyGui GPU)
+#  pip install pyserial dearpygui
 # ============================================================
+import dearpygui.dearpygui as dpg
 import serial
 import serial.tools.list_ports
 import json, threading, time, math, os, sys, webbrowser
-import tkinter as tk
-from tkinter import font as tkfont, ttk, simpledialog
+from collections import deque
 
 import database as db
 from recorder import SessionRecorder
-from replay_window import SessionBrowser
 from remote_sync import RemoteSync
 
 
 def _app_dir():
-    """Real app directory (next to .exe or script)."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -23,15 +21,19 @@ def _app_dir():
 # ============================================================
 # CONFIG
 # ============================================================
-APP_VERSION         = 4
+APP_VERSION         = 13
 NEAR_ZERO_THRESHOLD = 50
-TARGET_NAME         = "ForcePlatform"
-BOARD_WIDTH_CM      = 50
-BOARD_HEIGHT_CM     = 30
-BOARD_RATIO         = BOARD_WIDTH_CM / BOARD_HEIGHT_CM
+TARGET_NAME         = "GraviCore"
+BOARD_WIDTH_MM      = 50
+BOARD_HEIGHT_MM     = 40
+BOARD_RATIO         = BOARD_WIDTH_MM / BOARD_HEIGHT_MM
+TRAIL_LENGTH        = 15
+MARGIN              = 55
+CAP_R               = 14
+CROSS_SIZE          = 14
 
 # ============================================================
-# THEMES
+# THEMES  (hex — kept for replay_window compat)
 # ============================================================
 THEMES = {
     "dark": {
@@ -87,7 +89,7 @@ THEMES = {
 }
 
 # ============================================================
-# PREFERENCES (fichier JSON a cote du script)
+# PREFERENCES
 # ============================================================
 _SETTINGS_PATH = os.path.join(_app_dir(), "cm_settings.json")
 
@@ -107,109 +109,98 @@ def _save_settings(data):
     except Exception:
         pass
 
-# ============================================================
-# THEME ACTIF — variables globales utilisees partout
-# ============================================================
 current_theme = _load_settings().get("theme", "dark")
 if current_theme not in THEMES:
     current_theme = "dark"
 
-def _sync_colors():
-    global BG_DARK, BG_CARD, BG_CANVAS
-    global ACCENT_BLUE, ACCENT_TEAL, ACCENT_GREEN, ACCENT_AMBER, ACCENT_RED
-    global TEXT_PRIMARY, TEXT_SECONDARY, TEXT_DIM
-    global GRID_COLOR, BOARD_OUTLINE, BOARD_FILL
-    global CROSS_COLOR, COM_COLOR
-    global TARE_BG, TARE_HOVER, CAL_BG, CAL_HOVER
-    global BTN_CONNECT_BG, BTN_CONNECT_HV
-    global SENSOR_COLORS
-    t = THEMES[current_theme]
-    BG_DARK        = t["bg"]
-    BG_CARD        = t["bg_card"]
-    BG_CANVAS      = t["bg_canvas"]
-    ACCENT_BLUE    = t["accent_blue"]
-    ACCENT_TEAL    = t["accent_teal"]
-    ACCENT_GREEN   = t["accent_green"]
-    ACCENT_AMBER   = t["accent_amber"]
-    ACCENT_RED     = t["accent_red"]
-    TEXT_PRIMARY   = t["text_primary"]
-    TEXT_SECONDARY = t["text_secondary"]
-    TEXT_DIM       = t["text_dim"]
-    GRID_COLOR     = t["grid_color"]
-    BOARD_OUTLINE  = t["board_outline"]
-    BOARD_FILL     = t["board_fill"]
-    CROSS_COLOR    = t["cross_color"]
-    COM_COLOR      = t["com_color"]
-    TARE_BG        = t["tare_bg"]
-    TARE_HOVER     = t["tare_hover"]
-    CAL_BG         = t["cal_bg"]
-    CAL_HOVER      = t["cal_hover"]
-    BTN_CONNECT_BG = t["btn_connect_bg"]
-    BTN_CONNECT_HV = t["btn_connect_hv"]
-    SENSOR_COLORS  = list(t["sensor_colors"])
-
-_sync_colors()
-
 SENSOR_NAMES = ["Haut-Droit", "Haut-Gauche", "Bas-Droit", "Bas-Gauche"]
 
 # ============================================================
-# UTILITAIRES THEME
+# COLOR HELPERS
 # ============================================================
-def _hex_to_rgb(h):
+def _hex_rgba(h, a=255):
     h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), a)
 
-def _build_color_map(old_name, new_name):
-    old_t, new_t = THEMES[old_name], THEMES[new_name]
-    cmap = {}
-    for key in old_t:
-        ov, nv = old_t[key], new_t[key]
-        if isinstance(ov, str) and ov.startswith("#"):
-            cmap[ov] = nv
-        elif isinstance(ov, list):
-            for o, n in zip(ov, nv):
-                cmap[o] = n
-    return cmap
+# Pre-computed theme color cache (avoids hex parsing per-frame)
+_tc = {}
+_tc_sc = []
+_trail_colors = []
+_trail_sizes = []
 
-def _retheme_widgets(widget, cmap):
-    for prop in ("bg", "fg", "activebackground", "activeforeground",
-                 "highlightbackground", "insertbackground"):
-        try:
-            val = str(widget.cget(prop))
-            if val in cmap:
-                widget.config(**{prop: cmap[val]})
-        except Exception:
-            pass
-    for child in widget.winfo_children():
-        _retheme_widgets(child, cmap)
+def _refresh_theme_cache():
+    global _trail_colors, _trail_sizes
+    _tc.clear()
+    t = THEMES[current_theme]
+    for k, v in t.items():
+        if isinstance(v, str):
+            _tc[k] = _hex_rgba(v)
+    _tc_sc.clear()
+    _tc_sc.extend(_hex_rgba(c) for c in t["sensor_colors"])
+    # Pre-compute trail gradient
+    bg = _tc["bg_canvas"]
+    cr = _tc["cross_color"]
+    _trail_colors = []
+    _trail_sizes = []
+    for idx in range(TRAIL_LENGTH):
+        a = idx / TRAIL_LENGTH
+        _trail_colors.append((
+            int(bg[0] + (cr[0] - bg[0]) * a),
+            int(bg[1] + (cr[1] - bg[1]) * a),
+            int(bg[2] + (cr[2] - bg[2]) * a), 255))
+        _trail_sizes.append(1.5 + a * 3)
+
+def _t(key):
+    """Current theme color as RGBA (cached)."""
+    return _tc.get(key) or _hex_rgba(THEMES[current_theme][key])
+
+def _sc(i):
+    """Sensor color i as RGBA (cached)."""
+    return _tc_sc[i] if _tc_sc else _hex_rgba(THEMES[current_theme]["sensor_colors"][i])
+
+_refresh_theme_cache()
 
 # ============================================================
-# ÉTAT
+# STATE
 # ============================================================
 raw_w         = [0, 0, 0, 0]
 freq          = 0.0
 last_received = time.time()
-com_trail     = []
+_freq_times   = deque(maxlen=50)
+_sensor_bufs  = [deque(maxlen=5) for _ in range(4)]
+_sensor_prev  = [0.0] * 4
+_MAX_DELTA    = 3000
+com_trail     = deque(maxlen=TRAIL_LENGTH)
 calib_offsets = [0] * 4
 calib_scales  = [0.0] * 4
 response_queue = []
 resp_lock      = threading.Lock()
 serial_conn    = None
 
-# ── Database + Recorder + Remote Sync ────────────────────────
 db.init_db()
 recorder = SessionRecorder()
-web_server_thread = None
+web_server_thread  = None
 web_server_running = False
 
-# Remote sync (hardcoded — always on)
-_REMOTE_URL = ".../cm_api.php"
-_REMOTE_KEY = ""
+_REMOTE_URL = "https://gravicore.ibenji.fr/cm_api.php"
+_REMOTE_KEY = "c4d1146e19f391e0b6901bcb88c32d10e7f6e5174d12f179bd7a1018b4c9c8e0"
 remote_sync = RemoteSync(server_url=_REMOTE_URL, api_key=_REMOTE_KEY,
                          app_version=APP_VERSION)
 
+_update_ready_flag = False   # set by remote_sync thread
+_prev_weights  = [None] * 4
+_prev_total    = None
+_prev_freq_str = None
+
+# Board geometry (updated on resize)
+_board = {
+    "left": 0, "right": 0, "top": 0, "bottom": 0,
+    "cx": 0, "cy": 0, "last_size": (0, 0),
+    "trail_ids": [], "cross_ids": {},
+}
+
 # ============================================================
-# LECTURE SÉRIE (thread daemon)
+# SERIAL THREAD
 # ============================================================
 def _read_loop():
     global serial_conn, freq, last_received
@@ -223,14 +214,21 @@ def _read_loop():
                 continue
             data = json.loads(line)
             if "weight1" in data:
-                raw_w[0] = max(0, data["weight1"])
-                raw_w[1] = max(0, data["weight2"])
-                raw_w[2] = max(0, data["weight3"])
-                raw_w[3] = max(0, data["weight4"])
+                for _si, _sk in enumerate(("weight1","weight2","weight3","weight4")):
+                    v = max(0, data[_sk])
+                    _sensor_bufs[_si].append(v)
+                    med = sorted(_sensor_bufs[_si])[len(_sensor_bufs[_si]) // 2]
+                    prev = _sensor_prev[_si]
+                    if abs(med - prev) > _MAX_DELTA:
+                        med = prev + _MAX_DELTA if med > prev else prev - _MAX_DELTA
+                    _sensor_prev[_si] = med
+                    raw_w[_si] = med
                 now = time.time()
-                d   = now - last_received
-                if d > 0:
-                    freq = 1.0 / d
+                _freq_times.append(now)
+                if len(_freq_times) >= 2:
+                    span = _freq_times[-1] - _freq_times[0]
+                    if span > 0:
+                        freq = (len(_freq_times) - 1) / span
                 last_received = now
             elif "status" in data:
                 with resp_lock:
@@ -253,7 +251,7 @@ def send_json(obj: dict):
         print(f"[SEND] {e}")
 
 # ============================================================
-# DETECTION DES PORTS
+# PORT DETECTION
 # ============================================================
 def _is_target(port_info) -> bool:
     name = TARGET_NAME.lower()
@@ -262,7 +260,7 @@ def _is_target(port_info) -> bool:
     mfr  = (getattr(port_info, "manufacturer", "") or "").lower()
     return name in desc or name in hwid or name in mfr
 
-def _try_port(device: str, baud: int, timeout: float = 2.5):
+def _try_port(device, baud, timeout=2.5):
     try:
         s = serial.Serial(device, baud, timeout=0.5)
         deadline = time.time() + timeout
@@ -300,119 +298,132 @@ def list_ports():
     return result
 
 # ============================================================
-# INTERFACE TKINTER
+# DPG CONTEXT
 # ============================================================
-root = tk.Tk()
-root.title("Centre de Masse -- Plateforme de Force")
-root.geometry("1280x800")
-root.configure(bg=BG_DARK)
-root.resizable(True, True)
+dpg.create_context()
 
-# ── App icon ──
-def _find_icon():
-    """Locate icon.ico in bundle or next to script."""
-    candidates = []
-    if getattr(sys, 'frozen', False):
-        candidates.append(os.path.join(sys._MEIPASS, 'icon.ico'))
-        candidates.append(os.path.join(os.path.dirname(sys.executable), 'icon.ico'))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'))
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return None
+# ============================================================
+# FONTS
+# ============================================================
+_font_dir = "C:/Windows/Fonts"
+font_default = font_title = font_header = font_small = font_coords = None
+font_mono = font_mono_large = None
 
-_icon_path = _find_icon()
-if _icon_path:
-    try:
-        root.iconbitmap(_icon_path)
-    except Exception:
-        pass
+with dpg.font_registry():
+    segoe = os.path.join(_font_dir, "segoeui.ttf")
+    segoe_b = os.path.join(_font_dir, "segoeuib.ttf")
+    consola = os.path.join(_font_dir, "consola.ttf")
+    consola_b = os.path.join(_font_dir, "consolab.ttf")
+    if os.path.exists(segoe):
+        font_default = dpg.add_font(segoe, 20)
+        dpg.add_font_range(0x2600, 0x2700, parent=font_default)
+        font_small   = dpg.add_font(segoe, 16)
+    if os.path.exists(segoe_b):
+        font_title  = dpg.add_font(segoe_b, 30)
+        font_header = dpg.add_font(segoe_b, 20)
+        font_coords = dpg.add_font(segoe_b, 24)
+    if os.path.exists(consola):
+        font_mono = dpg.add_font(consola, 16)
+    if os.path.exists(consola_b):
+        font_mono_large = dpg.add_font(consola_b, 28)
 
-try:
-    root.state("zoomed")
-except Exception:
-    pass
+if font_default:
+    dpg.bind_font(font_default)
 
-try:
-    title_font  = tkfont.Font(family="Segoe UI", size=18, weight="bold")
-    header_font = tkfont.Font(family="Segoe UI", size=12, weight="bold")
-    value_font  = tkfont.Font(family="Consolas", size=18, weight="bold")
-    label_font  = tkfont.Font(family="Segoe UI", size=10)
-    small_font  = tkfont.Font(family="Segoe UI", size=9)
-    btn_font    = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-    mono_small  = tkfont.Font(family="Consolas", size=8)
-except Exception:
-    title_font  = ("Arial", 18, "bold")
-    header_font = ("Arial", 12, "bold")
-    value_font  = ("Courier", 18, "bold")
-    label_font  = ("Arial", 10)
-    small_font  = ("Arial", 9)
-    btn_font    = ("Arial", 10, "bold")
-    mono_small  = ("Courier", 8)
+# ============================================================
+# THEME ENGINE
+# ============================================================
+_theme_cache = {}
 
-# Style ttk
-style = ttk.Style()
-style.theme_use("clam")
+def _txt_theme(rgba):
+    key = ("t", tuple(rgba))
+    if key not in _theme_cache:
+        with dpg.theme() as t:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_Text, rgba)
+        _theme_cache[key] = t
+    return _theme_cache[key]
 
-def _update_ttk_style():
-    style.configure("TCombobox",
-                    fieldbackground=BG_CARD, background=BG_CARD,
-                    foreground=TEXT_PRIMARY, selectbackground=ACCENT_BLUE,
-                    selectforeground=BG_DARK, arrowcolor=TEXT_SECONDARY)
-    style.map("TCombobox",
-              fieldbackground=[("readonly", BG_CARD)],
-              foreground=[("readonly", TEXT_PRIMARY)])
+def _btn_theme(bg, hv=None, text=(241, 245, 249, 255)):
+    hv = hv or tuple(min(c + 30, 255) for c in bg[:3]) + (bg[3],)
+    key = ("b", tuple(bg), tuple(hv), tuple(text))
+    if key not in _theme_cache:
+        with dpg.theme() as t:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, bg)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hv)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, hv)
+                dpg.add_theme_color(dpg.mvThemeCol_Text, text)
+        _theme_cache[key] = t
+    return _theme_cache[key]
 
-_update_ttk_style()
+def _bar_theme(rgba):
+    key = ("bar", tuple(rgba))
+    if key not in _theme_cache:
+        with dpg.theme() as t:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, rgba)
+        _theme_cache[key] = t
+    return _theme_cache[key]
 
-def _update_notebook_style():
-    style.configure("LeftPanel.TNotebook", background=BG_DARK, borderwidth=0)
-    style.configure("LeftPanel.TNotebook.Tab",
-                    background=BG_CARD, foreground=TEXT_SECONDARY,
-                    padding=[10, 5])
-    style.map("LeftPanel.TNotebook.Tab",
-              background=[("selected", BG_DARK)],
-              foreground=[("selected", ACCENT_BLUE)])
+def _build_global_theme(name):
+    t = THEMES[name]
+    bg     = _hex_rgba(t["bg"])
+    card   = _hex_rgba(t["bg_card"])
+    txt    = _hex_rgba(t["text_primary"])
+    sec    = _hex_rgba(t["text_secondary"])
+    border = _hex_rgba(t["board_outline"])
+    accent = _hex_rgba(t["accent_blue"])
+    with dpg.theme() as theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_PopupBg, card)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, txt)
+            dpg.add_theme_color(dpg.mvThemeCol_Border, border)
+            dpg.add_theme_color(dpg.mvThemeCol_BorderShadow, (0, 0, 0, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, card)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, border)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, border)
+            dpg.add_theme_color(dpg.mvThemeCol_Button, card)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, border)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, accent)
+            dpg.add_theme_color(dpg.mvThemeCol_Tab, card)
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered, accent)
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_TabUnfocused, card)
+            dpg.add_theme_color(dpg.mvThemeCol_TabUnfocusedActive, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_Separator, border)
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBg, card)
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, border)
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, border)
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabHovered, sec)
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabActive, accent)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 5)
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 4)
+    return theme
 
-_update_notebook_style()
+_global_themes = {
+    "dark":  _build_global_theme("dark"),
+    "light": _build_global_theme("light"),
+}
+dpg.bind_theme(_global_themes[current_theme])
 
-# ── TITRE ────────────────────────────────────────────────────
-title_frame = tk.Frame(root, bg=BG_DARK)
-title_frame.pack(fill="x", padx=20, pady=(15, 5))
-tk.Label(title_frame, text="CENTRE DE MASSE", font=title_font,
-         fg=ACCENT_BLUE, bg=BG_DARK).pack(side="left")
+# ============================================================
+# UI STATE
+# ============================================================
+_port_list   = []
+_user_id_map = {}
+_plat_id_map = {}
+_prev_status = ("", "")
 
-btn_theme = tk.Button(
-    title_frame,
-    text=("\u2600" if current_theme == "dark" else "\u263e"),
-    font=btn_font, fg=TEXT_SECONDARY, bg=BG_DARK,
-    activebackground=BG_DARK, activeforeground=TEXT_PRIMARY,
-    relief="flat", cursor="hand2", bd=0, padx=8)
-btn_theme.pack(side="left", padx=(14, 0))
-
-label_freq = tk.Label(title_frame, text="-- Hz",
-                      font=label_font, fg=TEXT_SECONDARY, bg=BG_DARK)
-label_freq.pack(side="right", padx=10)
-label_status = tk.Label(title_frame, text="DECONNECTE",
-                         font=small_font, fg=ACCENT_RED, bg=BG_DARK)
-label_status.pack(side="right", padx=10)
-
-# ── BARRE UTILISATEUR / PLATEFORME ────────────────────────────
-user_plat_bar = tk.Frame(root, bg=BG_CARD, padx=14, pady=8,
-                          highlightbackground=BOARD_OUTLINE, highlightthickness=1)
-user_plat_bar.pack(fill="x", padx=20, pady=(0, 4))
-
-up_row = tk.Frame(user_plat_bar, bg=BG_CARD)
-up_row.pack(fill="x")
-
-tk.Label(up_row, text="UTILISATEUR", font=btn_font,
-         fg=TEXT_SECONDARY, bg=BG_CARD).pack(side="left", padx=(0, 6))
-
-user_var = tk.StringVar()
-user_combo = ttk.Combobox(up_row, textvariable=user_var,
-                           state="readonly", width=18, font=label_font)
-user_combo.pack(side="left", padx=(0, 4))
-
+# ============================================================
+# CALLBACKS  (defined before UI layout)
+# ============================================================
 def _refresh_users():
     users = db.list_users()
     _user_id_map.clear()
@@ -420,63 +431,12 @@ def _refresh_users():
     for uid, uname in users:
         names.append(uname)
         _user_id_map[uname] = uid
-    user_combo["values"] = names
-    # Restore last selection
+    dpg.configure_item("user_combo", items=names)
     saved = _load_settings().get("last_user", "")
     if saved in names:
-        user_var.set(saved)
+        dpg.set_value("user_combo", saved)
     elif names:
-        user_combo.current(0)
-
-_user_id_map = {}
-
-def _add_user():
-    name = simpledialog.askstring("Nouvel utilisateur", "Nom :",
-                                   parent=root)
-    if name and name.strip():
-        try:
-            db.add_user(name.strip())
-        except Exception:
-            pass
-        _refresh_users()
-        user_var.set(name.strip())
-
-btn_add_user = tk.Button(up_row, text="+", command=_add_user,
-                          font=btn_font, fg=ACCENT_GREEN, bg=TARE_BG,
-                          activebackground=TARE_HOVER, relief="flat",
-                          cursor="hand2", padx=6, pady=2)
-btn_add_user.pack(side="left", padx=(2, 2))
-
-def _del_user():
-    uname = user_var.get()
-    uid = _user_id_map.get(uname)
-    if uid is None:
-        return
-    from tkinter import messagebox
-    # Count sessions for this user
-    sessions = db.list_sessions(user_id=uid)
-    msg = f"Supprimer l'utilisateur \"{uname}\" ?"
-    if sessions:
-        msg += f"\n\n{len(sessions)} session(s) associee(s) seront aussi supprimees."
-    if messagebox.askyesno("Supprimer utilisateur", msg, parent=root):
-        for s in sessions:
-            db.delete_session(s["id"])
-        db.delete_user(uid)
-        _refresh_users()
-
-btn_del_user = tk.Button(up_row, text="-", command=_del_user,
-                          font=btn_font, fg=ACCENT_RED, bg=TARE_BG,
-                          activebackground=TARE_HOVER, relief="flat",
-                          cursor="hand2", padx=6, pady=2)
-btn_del_user.pack(side="left", padx=(0, 16))
-
-tk.Label(up_row, text="PLATEFORME", font=btn_font,
-         fg=TEXT_SECONDARY, bg=BG_CARD).pack(side="left", padx=(0, 6))
-
-plat_var = tk.StringVar()
-plat_combo = ttk.Combobox(up_row, textvariable=plat_var,
-                           state="readonly", width=22, font=label_font)
-plat_combo.pack(side="left", padx=(0, 4))
+        dpg.set_value("user_combo", names[0])
 
 def _refresh_platforms():
     platforms = db.list_platforms()
@@ -485,823 +445,856 @@ def _refresh_platforms():
     for pid, pname, pw, ph in platforms:
         names.append(pname)
         _plat_id_map[pname] = pid
-    plat_combo["values"] = names
+    dpg.configure_item("plat_combo", items=names)
     saved = _load_settings().get("last_platform", "")
     if saved in names:
-        plat_var.set(saved)
+        dpg.set_value("plat_combo", saved)
     elif names:
-        plat_combo.current(0)
+        dpg.set_value("plat_combo", names[0])
 
-_plat_id_map = {}
+def _on_user_change(s, a, u):
+    _save_settings({"last_user": dpg.get_value("user_combo")})
 
-def _add_platform():
-    name = simpledialog.askstring("Nouvelle plateforme", "Nom :",
-                                   parent=root)
-    if name and name.strip():
+def _on_plat_change(s, a, u):
+    _save_settings({"last_platform": dpg.get_value("plat_combo")})
+
+def _show_add_user(s=None, a=None, u=None):
+    dpg.set_value("add_user_input", "")
+    dpg.configure_item("add_user_modal", show=True)
+
+def _do_add_user(s=None, a=None, u=None):
+    name = dpg.get_value("add_user_input").strip()
+    if name:
         try:
-            db.add_platform(name.strip(), BOARD_WIDTH_CM, BOARD_HEIGHT_CM)
+            db.add_user(name)
+        except Exception:
+            pass
+        _refresh_users()
+        dpg.set_value("user_combo", name)
+    dpg.configure_item("add_user_modal", show=False)
+
+def _show_del_user(s=None, a=None, u=None):
+    uname = dpg.get_value("user_combo")
+    if uname and uname in _user_id_map:
+        sessions = db.list_sessions(user_id=_user_id_map[uname])
+        msg = f'Supprimer "{uname}" ?'
+        if sessions:
+            msg += f"\n{len(sessions)} session(s) seront supprimees."
+        dpg.set_value("del_confirm_text", msg)
+        dpg.set_item_user_data("del_confirm_ok", ("user", uname))
+        dpg.configure_item("del_confirm_modal", show=True)
+
+def _show_add_plat(s=None, a=None, u=None):
+    dpg.set_value("add_plat_input", "")
+    dpg.configure_item("add_plat_modal", show=True)
+
+def _do_add_plat(s=None, a=None, u=None):
+    name = dpg.get_value("add_plat_input").strip()
+    if name:
+        try:
+            db.add_platform(name, BOARD_WIDTH_MM, BOARD_HEIGHT_MM)
         except Exception:
             pass
         _refresh_platforms()
-        plat_var.set(name.strip())
+        dpg.set_value("plat_combo", name)
+    dpg.configure_item("add_plat_modal", show=False)
 
-btn_add_plat = tk.Button(up_row, text="+", command=_add_platform,
-                          font=btn_font, fg=ACCENT_GREEN, bg=TARE_BG,
-                          activebackground=TARE_HOVER, relief="flat",
-                          cursor="hand2", padx=6, pady=2)
-btn_add_plat.pack(side="left", padx=(2, 2))
+def _show_del_plat(s=None, a=None, u=None):
+    pname = dpg.get_value("plat_combo")
+    if pname and pname in _plat_id_map:
+        sessions = db.list_sessions(platform_id=_plat_id_map[pname])
+        msg = f'Supprimer "{pname}" ?'
+        if sessions:
+            msg += f"\n{len(sessions)} session(s) seront supprimees."
+        dpg.set_value("del_confirm_text", msg)
+        dpg.set_item_user_data("del_confirm_ok", ("platform", pname))
+        dpg.configure_item("del_confirm_modal", show=True)
 
-def _del_platform():
-    pname = plat_var.get()
-    pid = _plat_id_map.get(pname)
-    if pid is None:
-        return
-    from tkinter import messagebox
-    sessions = db.list_sessions(platform_id=pid)
-    msg = f"Supprimer la plateforme \"{pname}\" ?"
-    if sessions:
-        msg += f"\n\n{len(sessions)} session(s) associee(s) seront aussi supprimees."
-    if messagebox.askyesno("Supprimer plateforme", msg, parent=root):
-        for s in sessions:
-            db.delete_session(s["id"])
-        db.delete_platform(pid)
-        _refresh_platforms()
+def _do_delete_confirmed(s=None, a=None, u=None):
+    kind, name = dpg.get_item_user_data("del_confirm_ok")
+    if kind == "user":
+        uid = _user_id_map.get(name)
+        if uid:
+            for ses in db.list_sessions(user_id=uid):
+                db.delete_session(ses["id"])
+            db.delete_user(uid)
+            _refresh_users()
+    elif kind == "platform":
+        pid = _plat_id_map.get(name)
+        if pid:
+            for ses in db.list_sessions(platform_id=pid):
+                db.delete_session(ses["id"])
+            db.delete_platform(pid)
+            _refresh_platforms()
+    dpg.configure_item("del_confirm_modal", show=False)
 
-btn_del_plat = tk.Button(up_row, text="-", command=_del_platform,
-                          font=btn_font, fg=ACCENT_RED, bg=TARE_BG,
-                          activebackground=TARE_HOVER, relief="flat",
-                          cursor="hand2", padx=6, pady=2)
-btn_del_plat.pack(side="left", padx=(0, 0))
-
-# Save selection on change
-def _on_user_change(event=None):
-    _save_settings({"last_user": user_var.get()})
-def _on_plat_change(event=None):
-    _save_settings({"last_platform": plat_var.get()})
-user_combo.bind("<<ComboboxSelected>>", _on_user_change)
-plat_combo.bind("<<ComboboxSelected>>", _on_plat_change)
-
-_refresh_users()
-_refresh_platforms()
-
-# ── PANNEAU CONNEXION ─────────────────────────────────────────
-conn_panel = tk.Frame(root, bg=BG_CARD, padx=14, pady=10,
-                      highlightbackground=BOARD_OUTLINE, highlightthickness=1)
-conn_panel.pack(fill="x", padx=20, pady=(0, 8))
-
-conn_row = tk.Frame(conn_panel, bg=BG_CARD)
-conn_row.pack(fill="x")
-
-tk.Label(conn_row, text="PORT", font=btn_font,
-         fg=TEXT_SECONDARY, bg=BG_CARD).pack(side="left", padx=(0, 8))
-
-port_var   = tk.StringVar()
-port_combo = ttk.Combobox(conn_row, textvariable=port_var,
-                           state="readonly", width=46, font=label_font)
-port_combo.pack(side="left", padx=(0, 6))
-
-baud_var   = tk.StringVar(value="921600")
-baud_combo = ttk.Combobox(conn_row, textvariable=baud_var,
-                           state="readonly", width=9, font=label_font,
-                           values=["9600", "115200", "921600"])
-baud_combo.pack(side="left", padx=(0, 6))
-
-btn_refresh = tk.Button(conn_row, text="Actualiser", command=lambda: refresh_ports(),
-                        font=small_font, fg=TEXT_SECONDARY, bg=TARE_BG,
-                        activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                        relief="flat", cursor="hand2", padx=8, pady=4)
-btn_refresh.pack(side="left", padx=(0, 6))
-
-label_conn_info = tk.Label(conn_row, text="", font=mono_small,
-                            fg=TEXT_DIM, bg=BG_CARD)
-label_conn_info.pack(side="right", padx=(10, 0))
-
-btn_disconnect = tk.Button(conn_row, text="Deconnecter",
-                            font=btn_font, fg=ACCENT_RED, bg=TARE_BG,
-                            activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                            relief="flat", cursor="hand2", padx=10, pady=4)
-btn_disconnect.pack(side="right", padx=(6, 0))
-
-btn_connect = tk.Button(conn_row, text="Connecter",
-                        font=btn_font, fg=TEXT_PRIMARY, bg=BTN_CONNECT_BG,
-                        activebackground=BTN_CONNECT_HV, activeforeground=TEXT_PRIMARY,
-                        relief="flat", cursor="hand2", padx=12, pady=4)
-btn_connect.pack(side="right", padx=(0, 0))
-
-_port_list = []
-
-def refresh_ports():
+def _refresh_ports(s=None, a=None, u=None):
     global _port_list
     _port_list = list_ports()
     labels = [lbl for _, lbl, _, _ in _port_list]
-    port_combo["values"] = labels if labels else ["-- Aucun port --"]
-
+    dpg.configure_item("port_combo", items=labels if labels else ["-- Aucun port --"])
     target_idx = next((i for i, (_, _, _, t) in enumerate(_port_list) if t), None)
     bt_idx     = next((i for i, (_, _, bt, _) in enumerate(_port_list) if bt), None)
-
     if target_idx is not None:
-        port_combo.current(target_idx)
-        n_bt = sum(1 for _, _, bt, _ in _port_list if bt)
-        if n_bt > 1:
-            label_conn_info.config(
-                text=f"{n_bt} ports BT -- auto-detection a la connexion",
-                fg=ACCENT_AMBER)
-        else:
-            label_conn_info.config(text="ForcePlatform detecte", fg=ACCENT_GREEN)
+        dpg.set_value("port_combo", labels[target_idx])
+        dpg.set_value("label_conn_info", "ForcePlatform detecte")
     elif bt_idx is not None:
-        port_combo.current(bt_idx)
+        dpg.set_value("port_combo", labels[bt_idx])
         n_bt = sum(1 for _, _, bt, _ in _port_list if bt)
-        if n_bt > 1:
-            label_conn_info.config(
-                text=f"{n_bt} ports BT -- auto-detection a la connexion",
-                fg=ACCENT_AMBER)
-        else:
-            label_conn_info.config(text="1 port BT detecte", fg=ACCENT_GREEN)
+        dpg.set_value("label_conn_info",
+                      f"{n_bt} ports BT" if n_bt > 1 else "1 port BT")
     elif labels:
-        port_combo.current(0)
-        label_conn_info.config(
-            text=f"{len(labels)} port(s) -- aucun BT trouve", fg=ACCENT_AMBER)
+        dpg.set_value("port_combo", labels[0])
+        dpg.set_value("label_conn_info", f"{len(labels)} port(s)")
     else:
-        label_conn_info.config(text="Aucun port", fg=ACCENT_RED)
+        dpg.set_value("label_conn_info", "Aucun port")
 
-def do_connect():
+def _do_connect(s=None, a=None, u=None):
     global serial_conn, _port_list
     if not _port_list:
-        label_conn_info.config(text="Aucun port disponible", fg=ACCENT_RED)
+        dpg.set_value("label_conn_info", "Aucun port disponible")
         return
-
-    sel_label = port_var.get()
+    sel = dpg.get_value("port_combo")
     device, is_bt, is_target = None, False, False
     for dev, lbl, bt, tgt in _port_list:
-        if lbl == sel_label:
+        if lbl == sel:
             device, is_bt, is_target = dev, bt, tgt
             break
     if not device:
-        label_conn_info.config(text="Selectionne un port", fg=ACCENT_RED)
+        dpg.set_value("label_conn_info", "Selectionne un port")
         return
-
     if serial_conn:
         try: serial_conn.close()
         except: pass
         serial_conn = None
-
-    baud = int(baud_var.get())
-
+    baud = int(dpg.get_value("baud_combo"))
     if is_bt or is_target:
         candidates = [device]
         for dev, lbl, bt, tgt in _port_list:
             if bt and dev != device:
                 candidates.append(dev)
-
-        label_conn_info.config(
-            text=f"Test de {len(candidates)} port(s) BT...", fg=ACCENT_AMBER)
-        root.update_idletasks()
-
+        dpg.set_value("label_conn_info", f"Test de {len(candidates)} port(s)...")
         found = None
         for cand in candidates:
-            label_conn_info.config(text=f"Test {cand}...", fg=ACCENT_AMBER)
-            root.update_idletasks()
-            s = _try_port(cand, baud)
-            if s:
-                found = (cand, s)
+            dpg.set_value("label_conn_info", f"Test {cand}...")
+            conn = _try_port(cand, baud)
+            if conn:
+                found = (cand, conn)
                 break
-
         if not found:
-            label_conn_info.config(
-                text="Aucun port ne repond -- verifier le jumelage BT",
-                fg=ACCENT_RED)
+            dpg.set_value("label_conn_info", "Aucun port ne repond")
             return
-
-        device, s = found
-        working_dev = device
-        _port_list = [(dev, lbl, bt, tgt) for dev, lbl, bt, tgt in _port_list
-                      if not (bt and dev != working_dev)]
-        labels = [lbl for _, lbl, _, _ in _port_list]
-        port_combo["values"] = labels
-        for i, (dev, _, _, _) in enumerate(_port_list):
-            if dev == working_dev:
-                port_combo.current(i)
-                break
+        device, conn = found
+        serial_conn = conn
     else:
-        label_conn_info.config(text="Connexion...", fg=ACCENT_AMBER)
-        root.update_idletasks()
+        dpg.set_value("label_conn_info", "Connexion...")
         try:
-            s = serial.Serial(device, baud, timeout=1)
+            serial_conn = serial.Serial(device, baud, timeout=1)
         except Exception as e:
-            label_conn_info.config(text=f"Erreur: {e}", fg=ACCENT_RED)
+            dpg.set_value("label_conn_info", f"Erreur: {e}")
             return
+    mode = "BT" if is_bt else "USB"
+    dpg.set_value("label_conn_info", f"Connecte {mode} {device}")
 
-    serial_conn = s
-    mode = "Bluetooth" if is_bt else "USB"
-    label_conn_info.config(text=f"Connecte  {mode}  {device}", fg=ACCENT_GREEN)
-    root.after(1000, get_calib)
-
-def do_disconnect():
+def _do_disconnect(s=None, a=None, u=None):
     global serial_conn
     if serial_conn:
         try: serial_conn.close()
         except: pass
         serial_conn = None
-    label_conn_info.config(text="Deconnecte", fg=TEXT_DIM)
+    dpg.set_value("label_conn_info", "Deconnecte")
 
-btn_connect.config(command=do_connect)
-btn_disconnect.config(command=do_disconnect)
-refresh_ports()
-
-# ============================================================
-# CONTENU PRINCIPAL
-# ============================================================
-main_frame = tk.Frame(root, bg=BG_DARK)
-main_frame.pack(fill="both", expand=True, padx=20, pady=0)
-
-# ── Panneau gauche ───────────────────────────────────────────
-left_panel = tk.Frame(main_frame, bg=BG_DARK, width=315)
-left_panel.pack(side="left", fill="y", padx=(0, 15))
-left_panel.pack_propagate(False)
-
-# ── Onglets panneau gauche ──────────────────────────────────
-notebook = ttk.Notebook(left_panel, style="LeftPanel.TNotebook")
-notebook.pack(fill="both", expand=True)
-
-tab_capteurs = tk.Frame(notebook, bg=BG_DARK)
-tab_calibration = tk.Frame(notebook, bg=BG_DARK)
-tab_outils = tk.Frame(notebook, bg=BG_DARK)
-
-notebook.add(tab_capteurs, text="  Capteurs  ")
-notebook.add(tab_calibration, text="  Calibration  ")
-notebook.add(tab_outils, text="  Outils  ")
-
-# ── Tab Capteurs ─────────────────────────────────────────────
-tk.Label(tab_capteurs, text="CAPTEURS", font=header_font,
-         fg=TEXT_SECONDARY, bg=BG_DARK).pack(anchor="w", pady=(6, 6))
-
-weight_labels = []
-weight_bars   = []
-bar_canvases  = []
-
-for i in range(4):
-    card = tk.Frame(tab_capteurs, bg=BG_CARD, padx=10, pady=6,
-                    highlightbackground=SENSOR_COLORS[i], highlightthickness=1)
-    card.pack(fill="x", pady=3)
-    top_row = tk.Frame(card, bg=BG_CARD)
-    top_row.pack(fill="x")
-    tk.Label(top_row, text=f"{SENSOR_NAMES[i]}",
-             font=label_font, fg=SENSOR_COLORS[i], bg=BG_CARD).pack(side="left")
-    val_lbl = tk.Label(top_row, text="0.000 kg", font=value_font,
-                       fg=TEXT_PRIMARY, bg=BG_CARD)
-    val_lbl.pack(side="right")
-    weight_labels.append(val_lbl)
-    bar_cv = tk.Canvas(card, height=4, bg=BG_DARK, highlightthickness=0)
-    bar_cv.pack(fill="x", pady=(4, 0))
-    bar_rect = bar_cv.create_rectangle(0, 0, 0, 4, fill=SENSOR_COLORS[i], outline="")
-    bar_canvases.append(bar_cv)
-    weight_bars.append(bar_rect)
-
-total_frame = tk.Frame(tab_capteurs, bg=BG_CARD, padx=10, pady=8,
-                       highlightbackground=ACCENT_BLUE, highlightthickness=2)
-total_frame.pack(fill="x", pady=(10, 4))
-tk.Label(total_frame, text="POIDS TOTAL", font=label_font,
-         fg=TEXT_SECONDARY, bg=BG_CARD).pack(anchor="w")
-label_total = tk.Label(total_frame, text="0.000 kg", font=value_font,
-                       fg=ACCENT_BLUE, bg=BG_CARD)
-label_total.pack(anchor="e")
-
-def send_tare():
+def _send_tare(s=None, a=None, u=None):
     send_json({"cmd": "tare"})
-    btn_tare.config(text="TARE ENVOYE", fg=ACCENT_GREEN)
-    root.after(1500, lambda: btn_tare.config(text="TARE", fg=TEXT_PRIMARY))
 
-btn_tare = tk.Button(tab_capteurs, text="TARE", command=send_tare,
-                     font=btn_font, fg=TEXT_PRIMARY, bg=TARE_BG,
-                     activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                     relief="flat", cursor="hand2", padx=10, pady=7)
-btn_tare.pack(fill="x", pady=(4, 0))
-
-# ── Tab Calibration ──────────────────────────────────────────
-tk.Label(tab_calibration, text="CALIBRATION", font=header_font,
-         fg=TEXT_SECONDARY, bg=BG_DARK).pack(anchor="w", pady=(6, 6))
-
-ref_frame = tk.Frame(tab_calibration, bg=BG_DARK)
-ref_frame.pack(fill="x", pady=(6, 4))
-tk.Label(ref_frame, text="Poids ref :", font=label_font,
-         fg=TEXT_SECONDARY, bg=BG_DARK).pack(side="left")
-entry_ref_weight = tk.Entry(ref_frame, width=7, bg=BG_CARD, fg=TEXT_PRIMARY,
-                             insertbackground=TEXT_PRIMARY, relief="flat",
-                             font=btn_font, justify="center")
-entry_ref_weight.insert(0, "1")
-entry_ref_weight.pack(side="left", padx=(6, 2))
-tk.Label(ref_frame, text="kg", font=label_font, fg=TEXT_DIM, bg=BG_DARK).pack(side="left")
-
-log_frame = tk.Frame(tab_calibration, bg=BG_CARD, highlightbackground=BOARD_OUTLINE,
-                     highlightthickness=1)
-log_frame.pack(fill="x", pady=(2, 6))
-label_cal_log = tk.Label(log_frame, text="-- en attente --", font=mono_small,
-                          fg=TEXT_DIM, bg=BG_CARD, wraplength=290,
-                          justify="left", padx=6, pady=4)
-label_cal_log.pack(fill="x")
-
-cal_btn_frame = tk.Frame(tab_calibration, bg=BG_DARK)
-cal_btn_frame.pack(fill="x")
-cal_buttons = []
-
-def make_cal_callback(idx):
-    def cb():
+def _make_cal_cb(idx):
+    def cb(s=None, a=None, u=None):
         try:
-            ref = float(entry_ref_weight.get())
-        except ValueError:
-            label_cal_log.config(text="Poids invalide", fg=ACCENT_RED)
+            ref = dpg.get_value("entry_ref_weight")
+        except Exception:
             return
         send_json({"cmd": "cal", "sensor": idx + 1, "weight": ref * 1000})
-        cal_buttons[idx].config(
-            text=f"CAL {idx+1}  {SENSOR_NAMES[idx]} ...", fg=ACCENT_AMBER)
-        label_cal_log.config(
-            text=f"Calibration capteur {idx+1}...\nPose {ref:.3f} kg dessus.",
-            fg=ACCENT_AMBER)
+        dpg.set_value("label_cal_log", f"Calibration capteur {idx+1}...")
     return cb
 
-for i in range(4):
-    btn = tk.Button(cal_btn_frame, text=f"CAL {i+1}  {SENSOR_NAMES[i]}",
-                    command=make_cal_callback(i),
-                    font=btn_font, fg=SENSOR_COLORS[i], bg=CAL_BG,
-                    activebackground=CAL_HOVER, activeforeground=TEXT_PRIMARY,
-                    relief="flat", cursor="hand2", anchor="w", padx=8, pady=5)
-    btn.pack(fill="x", pady=2)
-    cal_buttons.append(btn)
-
-def get_calib():
+def _get_calib(s=None, a=None, u=None):
     send_json({"cmd": "get_calib"})
-    label_cal_log.config(text="Recuperation des valeurs...", fg=ACCENT_TEAL)
+    dpg.set_value("label_cal_log", "Recuperation...")
 
-btn_get_calib = tk.Button(tab_calibration, text="Lire calibration ESP",
-                           command=get_calib,
-                           font=btn_font, fg=ACCENT_TEAL, bg=TARE_BG,
-                           activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                           relief="flat", cursor="hand2", padx=10, pady=6)
-btn_get_calib.pack(fill="x", pady=(4, 0))
+def _toggle_recording(s=None, a=None, u=None):
+    if recorder.is_recording:
+        sid = recorder.stop()
+        dpg.set_item_label("btn_rec", "DEMARRER ENREGISTREMENT")
+        dpg.bind_item_theme("btn_rec", _btn_theme(_t("btn_connect_bg"),
+                            _t("btn_connect_hv")))
+        dpg.set_value("lbl_rec_time", "")
+        dpg.set_value("lbl_rec_samples",
+                      f"Session #{sid} sauvegardee" if sid else "")
+    else:
+        uname = dpg.get_value("user_combo")
+        pname = dpg.get_value("plat_combo")
+        uid = _user_id_map.get(uname)
+        pid = _plat_id_map.get(pname)
+        if uid is None:
+            dpg.set_value("lbl_rec_samples", "Selectionner un utilisateur")
+            return
+        if pid is None:
+            dpg.set_value("lbl_rec_samples", "Selectionner une plateforme")
+            return
+        recorder.start(uid, pid)
+        dpg.set_item_label("btn_rec", "ARRETER ENREGISTREMENT")
+        dpg.bind_item_theme("btn_rec", _btn_theme(_t("accent_red"),
+                            _t("accent_amber")))
 
-calib_display_labels = []
-for i in range(4):
-    lbl = tk.Label(tab_calibration, text=f"C{i+1}: off=--  sc=--",
-                   font=mono_small, fg=SENSOR_COLORS[i], bg=BG_DARK, anchor="w")
-    lbl.pack(fill="x")
-    calib_display_labels.append(lbl)
+def _open_history(s=None, a=None, u=None):
+    """Launch tkinter SessionBrowser in a separate thread."""
+    def _run():
+        import tkinter as tk
+        from replay_window import SessionBrowser
+        root = tk.Tk()
+        root.withdraw()
+        SessionBrowser(root, THEMES, current_theme,
+                       (_load_settings, _save_settings))
+        root.mainloop()
+    threading.Thread(target=_run, daemon=True).start()
 
-# ── Tab Outils ───────────────────────────────────────────────
-def _open_history():
-    SessionBrowser(root, THEMES, current_theme,
-                   (_load_settings, _save_settings))
-
-btn_history = tk.Button(tab_outils, text="HISTORIQUE SESSIONS",
-                        command=_open_history,
-                        font=btn_font, fg=ACCENT_BLUE, bg=TARE_BG,
-                        activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                        relief="flat", cursor="hand2", padx=10, pady=7)
-btn_history.pack(fill="x", pady=(10, 4))
-
-_dashboard_url = ""
-
-def _toggle_dashboard():
-    global web_server_thread, web_server_running, _dashboard_url
+def _toggle_dashboard(s=None, a=None, u=None):
+    global web_server_thread, web_server_running
     if web_server_running:
         web_server_running = False
-        _dashboard_url = ""
-        btn_dashboard.config(text="DASHBOARD WEB : OFF", fg=TEXT_SECONDARY)
-        lbl_dashboard_url.config(text="", cursor="")
+        dpg.set_item_label("btn_dashboard", "DASHBOARD WEB : OFF")
+        dpg.set_value("lbl_dashboard_url", "")
     else:
         try:
-            from web_dashboard import start_web_server, stop_web_server
+            from web_dashboard import start_web_server
             import socket
             port = 5000
             web_server_thread = start_web_server(port)
             web_server_running = True
-            # Get local IP
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.connect(("8.8.8.8", 80))
+                local_ip = sock.getsockname()[0]
+                sock.close()
             except Exception:
                 local_ip = "localhost"
-            _dashboard_url = f"http://{local_ip}:{port}"
-            btn_dashboard.config(text="DASHBOARD WEB : ON", fg=ACCENT_GREEN)
-            lbl_dashboard_url.config(
-                text=_dashboard_url, fg=ACCENT_TEAL, cursor="hand2")
-            # Open browser automatically
-            webbrowser.open(_dashboard_url)
+            url = f"http://{local_ip}:{port}"
+            dpg.set_item_label("btn_dashboard", "DASHBOARD WEB : ON")
+            dpg.set_value("lbl_dashboard_url", url)
+            webbrowser.open(url)
         except Exception as e:
-            lbl_dashboard_url.config(text=f"Erreur: {e}", fg=ACCENT_RED)
+            dpg.set_value("lbl_dashboard_url", f"Erreur: {e}")
 
-def _open_dashboard_url(event=None):
-    if _dashboard_url:
-        webbrowser.open(_dashboard_url)
+def _toggle_theme(s=None, a=None, u=None):
+    global current_theme
+    current_theme = "light" if current_theme == "dark" else "dark"
+    _refresh_theme_cache()
+    dpg.bind_theme(_global_themes[current_theme])
+    dpg.set_item_label("btn_theme", "\u2600" if current_theme == "dark" else "\u263e")
+    _apply_accent_colors()
+    _force_board_redraw()
+    _save_settings({"theme": current_theme})
 
-btn_dashboard = tk.Button(tab_outils, text="DASHBOARD WEB : OFF",
-                          command=_toggle_dashboard,
-                          font=btn_font, fg=TEXT_SECONDARY, bg=TARE_BG,
-                          activebackground=TARE_HOVER, activeforeground=TEXT_PRIMARY,
-                          relief="flat", cursor="hand2", padx=10, pady=7)
-btn_dashboard.pack(fill="x", pady=(0, 2))
+# ============================================================
+# UI LAYOUT
+# ============================================================
+with dpg.window(tag="main_window", no_title_bar=True, no_move=True,
+                no_resize=True, no_scrollbar=True):
 
-lbl_dashboard_url = tk.Label(tab_outils, text="", font=mono_small,
-                              fg=ACCENT_TEAL, bg=BG_DARK)
-lbl_dashboard_url.pack(fill="x")
-lbl_dashboard_url.bind("<Button-1>", _open_dashboard_url)
-lbl_dashboard_url.bind("<Enter>",
-    lambda e: lbl_dashboard_url.config(font=("Consolas", 8, "underline"))
-    if _dashboard_url else None)
-lbl_dashboard_url.bind("<Leave>",
-    lambda e: lbl_dashboard_url.config(font=mono_small))
+    # ── Title bar (table: title left, freq/status right) ────
+    with dpg.table(header_row=False, borders_innerH=False,
+                   borders_innerV=False, borders_outerH=False,
+                   borders_outerV=False):
+        dpg.add_table_column(width_fixed=True)
+        dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+        dpg.add_table_column(width_fixed=True)
+        with dpg.table_row():
+            with dpg.group(horizontal=True):
+                t_title = dpg.add_text("GraviCore", tag="title_text")
+                if font_title:
+                    dpg.bind_item_font(t_title, font_title)
+                dpg.add_spacer(width=10)
+                with dpg.group():
+                    dpg.add_spacer(height=4)
+                    dpg.add_button(label="\u2600" if current_theme == "dark" else "\u263e",
+                                   tag="btn_theme", callback=_toggle_theme,
+                                   width=36, height=36)
+            dpg.add_spacer()
+            with dpg.group():
+                dpg.add_spacer(height=7)
+                with dpg.group(horizontal=True):
+                    t_freq = dpg.add_text("-- Hz", tag="label_freq")
+                    if font_small:
+                        dpg.bind_item_font(t_freq, font_small)
+                    dpg.add_spacer(width=15)
+                    t_status = dpg.add_text("DECONNECTE", tag="label_status")
+                    if font_small:
+                        dpg.bind_item_font(t_status, font_small)
 
-# ── Remote sync auto-start (invisible, always on) ────────────
-def _on_update_ready():
-    """Called from remote_sync thread when a new .exe is downloaded.
-    Show notification then schedule a clean app exit on the main thread."""
-    def _show_and_close():
-        from tkinter import messagebox
-        new_ver = getattr(remote_sync, '_new_version', '?')
-        messagebox.showinfo(
-            "Mise a jour",
-            f"Nouvelle version (v{new_ver}) telechargee !\n\n"
-            "L'application va redemarrer pour\n"
-            "appliquer la mise a jour.")
-        _on_close()
-    root.after(0, _show_and_close)
+    dpg.add_separator()
 
-remote_sync.on_update_ready = _on_update_ready
-remote_sync.start()
+    # ── User / Platform bar ──────────────────────────────────
+    with dpg.group(horizontal=True):
+        dpg.add_text("UTILISATEUR")
+        dpg.add_combo([], tag="user_combo", width=160, callback=_on_user_change)
+        dpg.add_button(label="+ Ajouter", callback=_show_add_user)
+        dpg.add_button(label="Suppr.", callback=_show_del_user)
+        dpg.add_spacer(width=30)
+        dpg.add_text("PLATEFORME")
+        dpg.add_combo([], tag="plat_combo", width=200, callback=_on_plat_change)
+        dpg.add_button(label="+ Ajouter", callback=_show_add_plat)
+        dpg.add_button(label="Suppr.", callback=_show_del_plat)
 
-# ── Panneau droit : canvas ────────────────────────────────────
-right_panel = tk.Frame(main_frame, bg=BG_DARK)
-right_panel.pack(side="right", fill="both", expand=True)
+    dpg.add_separator()
 
-# ── Recording controls ────────────────────────────────────────
-rec_bar = tk.Frame(right_panel, bg=BG_DARK)
-rec_bar.pack(fill="x", pady=(0, 6))
+    # ── Connection bar ───────────────────────────────────────
+    with dpg.group(horizontal=True):
+        dpg.add_text("PORT")
+        dpg.add_combo([], tag="port_combo", width=380)
+        dpg.add_combo(["9600", "115200", "921600"], tag="baud_combo",
+                       default_value="921600", width=100)
+        dpg.add_button(label="Actualiser", callback=_refresh_ports)
+        btn_conn = dpg.add_button(label="Connecter", tag="btn_connect",
+                                  callback=_do_connect)
+        dpg.bind_item_theme(btn_conn, _btn_theme(_t("btn_connect_bg"),
+                            _t("btn_connect_hv")))
+        dpg.add_button(label="Deconnecter", callback=_do_disconnect)
+        dpg.add_spacer(width=10)
+        ci = dpg.add_text("", tag="label_conn_info")
+        if font_mono:
+            dpg.bind_item_font(ci, font_mono)
 
-_rec_blink_state = False
+    dpg.add_separator()
+    dpg.add_spacer(height=2)
 
-def _toggle_recording():
-    global _rec_blink_state
-    if recorder.is_recording:
-        sid = recorder.stop()
-        btn_rec.config(text="DEMARRER ENREGISTREMENT", fg=TEXT_PRIMARY,
-                       bg=BTN_CONNECT_BG, activebackground=BTN_CONNECT_HV)
-        lbl_rec_time.config(text="")
-        lbl_rec_samples.config(text=f"Session #{sid} sauvegardee" if sid else "")
-        _rec_blink_state = False
-    else:
-        # Need user + platform
-        uname = user_var.get()
-        pname = plat_var.get()
-        uid = _user_id_map.get(uname)
-        pid = _plat_id_map.get(pname)
-        if uid is None:
-            lbl_rec_samples.config(text="Selectionner un utilisateur", fg=ACCENT_RED)
-            return
-        if pid is None:
-            lbl_rec_samples.config(text="Selectionner une plateforme", fg=ACCENT_RED)
-            return
-        recorder.start(uid, pid)
-        btn_rec.config(text="ARRETER ENREGISTREMENT", fg=TEXT_PRIMARY,
-                       bg=ACCENT_RED, activebackground=ACCENT_AMBER)
+    # ── Main content ─────────────────────────────────────────
+    with dpg.group(horizontal=True, tag="main_content"):
 
-btn_rec = tk.Button(rec_bar, text="DEMARRER ENREGISTREMENT",
-                    command=_toggle_recording,
-                    font=btn_font, fg=TEXT_PRIMARY, bg=BTN_CONNECT_BG,
-                    activebackground=BTN_CONNECT_HV,
-                    relief="flat", cursor="hand2", padx=14, pady=6)
-btn_rec.pack(side="left")
+        # ── LEFT PANEL ───────────────────────────────────────
+        with dpg.child_window(width=280, tag="left_panel", border=False):
+            with dpg.tab_bar():
 
-lbl_rec_time = tk.Label(rec_bar, text="", font=("Consolas", 11, "bold"),
-                         fg=ACCENT_RED, bg=BG_DARK)
-lbl_rec_time.pack(side="left", padx=(10, 0))
+                # TAB: Capteurs
+                with dpg.tab(label="  Capteurs  "):
+                    t_cap = dpg.add_text("CAPTEURS")
+                    if font_header:
+                        dpg.bind_item_font(t_cap, font_header)
+                    dpg.bind_item_theme(t_cap, _txt_theme(_t("text_secondary")))
+                    dpg.add_spacer(height=4)
 
-lbl_rec_samples = tk.Label(rec_bar, text="", font=small_font,
-                            fg=TEXT_DIM, bg=BG_DARK)
-lbl_rec_samples.pack(side="left", padx=(10, 0))
+                    for i in range(4):
+                        with dpg.group(horizontal=True):
+                            sn = dpg.add_text(SENSOR_NAMES[i],
+                                              tag=f"sensor_name_{i}")
+                            dpg.bind_item_theme(sn, _txt_theme(_sc(i)))
+                            dpg.add_spacer(width=20)
+                            wt = dpg.add_text("0.00 kg", tag=f"weight_{i}")
+                            if font_mono_large:
+                                dpg.bind_item_font(wt, font_mono_large)
+                        bar = dpg.add_progress_bar(default_value=0,
+                                                   tag=f"bar_{i}", width=-1)
+                        dpg.bind_item_theme(bar, _bar_theme(_sc(i)))
+                        dpg.add_spacer(height=2)
 
-visu_header = tk.Frame(right_panel, bg=BG_DARK)
-visu_header.pack(fill="x", pady=(0, 8))
-tk.Label(visu_header, text="VISUALISATION", font=header_font,
-         fg=TEXT_SECONDARY, bg=BG_DARK).pack(side="left")
-tk.Label(visu_header, text=f"Planche {BOARD_WIDTH_CM}x{BOARD_HEIGHT_CM} cm",
-         font=small_font, fg=TEXT_DIM, bg=BG_DARK).pack(side="left", padx=(12, 0))
-label_coords = tk.Label(visu_header, text="X: 0.0%  Y: 0.0%",
-                         font=label_font, fg=ACCENT_TEAL, bg=BG_DARK)
-label_coords.pack(side="right")
+                    dpg.add_separator()
+                    dpg.add_spacer(height=4)
 
-canvas = tk.Canvas(right_panel, bg=BG_CANVAS, highlightthickness=1,
-                   highlightbackground=BOARD_OUTLINE)
-canvas.pack(fill="both", expand=True)
+                    with dpg.group(horizontal=True):
+                        tl = dpg.add_text("POIDS TOTAL")
+                        dpg.bind_item_theme(tl, _txt_theme(_t("text_secondary")))
+                        dpg.add_spacer(width=20)
+                        tt = dpg.add_text("0.00 kg", tag="label_total")
+                        if font_mono_large:
+                            dpg.bind_item_font(tt, font_mono_large)
+                        dpg.bind_item_theme(tt, _txt_theme(_t("accent_blue")))
 
-MARGIN = 50
-CAP_R  = 14
-CROSS_SIZE = 14
-board_left = board_right = board_top = board_bottom = 0
-board_cx = board_cy = 0
-sensor_val_texts = []
-_last_board_size = (0, 0)
+                    dpg.add_spacer(height=6)
+                    btn_tare = dpg.add_button(label="TARE", callback=_send_tare,
+                                              width=-1, height=32)
+                    dpg.bind_item_theme(btn_tare, _btn_theme(_t("tare_bg"),
+                                        _t("tare_hover"), _t("text_primary")))
 
-trail_items  = []
-TRAIL_LENGTH = 15
-com_h_line = canvas.create_line(0, 0, 0, 0, fill=CROSS_COLOR, width=2)
-com_v_line = canvas.create_line(0, 0, 0, 0, fill=CROSS_COLOR, width=2)
-com_label  = canvas.create_text(0, 0, text="CoM", fill=COM_COLOR,
-                                 font=("Segoe UI", 9, "bold"))
+                # TAB: Calibration
+                with dpg.tab(label="  Calibration  "):
+                    t_cal = dpg.add_text("CALIBRATION")
+                    if font_header:
+                        dpg.bind_item_font(t_cal, font_header)
+                    dpg.bind_item_theme(t_cal, _txt_theme(_t("text_secondary")))
+                    dpg.add_spacer(height=4)
 
-def draw_board(event=None):
-    global board_left, board_right, board_top, board_bottom
-    global board_cx, board_cy, sensor_val_texts, _last_board_size
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Poids ref :")
+                        dpg.add_input_float(tag="entry_ref_weight",
+                                            default_value=1.0, width=80,
+                                            format="%.3f", step=0)
+                        dpg.add_text("kg")
 
-    cw = canvas.winfo_width()
-    ch = canvas.winfo_height()
-    if cw < 120 or ch < 120:
-        return
-    if (cw, ch) == _last_board_size:
-        return
-    _last_board_size = (cw, ch)
+                    dpg.add_spacer(height=4)
+                    cl = dpg.add_text("-- en attente --", tag="label_cal_log",
+                                      wrap=240)
+                    if font_mono:
+                        dpg.bind_item_font(cl, font_mono)
+                    dpg.add_spacer(height=4)
 
-    canvas.delete("board_static")
-    sensor_val_texts = []
+                    for i in range(4):
+                        b = dpg.add_button(label=f"CAL {i+1}  {SENSOR_NAMES[i]}",
+                                           tag=f"btn_cal_{i}",
+                                           callback=_make_cal_cb(i), width=-1)
+                        dpg.bind_item_theme(b, _btn_theme(_t("cal_bg"),
+                                            _t("cal_hover"), _sc(i)))
+                        dpg.add_spacer(height=2)
 
-    avail_w = cw - 2 * MARGIN
-    avail_h = ch - 2 * MARGIN
+                    dpg.add_spacer(height=4)
+                    dpg.add_button(label="Lire calibration ESP",
+                                   callback=_get_calib, width=-1)
+                    dpg.add_spacer(height=4)
+
+                    for i in range(4):
+                        cdl = dpg.add_text(f"C{i+1}: off=--  sc=--",
+                                           tag=f"calib_lbl_{i}")
+                        if font_mono:
+                            dpg.bind_item_font(cdl, font_mono)
+                        dpg.bind_item_theme(cdl, _txt_theme(_sc(i)))
+
+                # TAB: Outils
+                with dpg.tab(label="  Outils  "):
+                    dpg.add_spacer(height=8)
+                    dpg.add_button(label="HISTORIQUE SESSIONS",
+                                   callback=_open_history, width=-1, height=35)
+                    dpg.add_spacer(height=4)
+                    dpg.add_button(label="DASHBOARD WEB : OFF",
+                                   tag="btn_dashboard",
+                                   callback=_toggle_dashboard, width=-1,
+                                   height=35)
+                    dpg.add_spacer(height=4)
+                    durl = dpg.add_text("", tag="lbl_dashboard_url")
+                    if font_mono:
+                        dpg.bind_item_font(durl, font_mono)
+
+        # ── RIGHT PANEL ──────────────────────────────────────
+        with dpg.child_window(tag="right_panel", border=False):
+            # Recording controls
+            with dpg.group(horizontal=True):
+                btn_r = dpg.add_button(label="DEMARRER ENREGISTREMENT",
+                                       tag="btn_rec",
+                                       callback=_toggle_recording, height=32)
+                dpg.bind_item_theme(btn_r, _btn_theme(_t("btn_connect_bg"),
+                                    _t("btn_connect_hv")))
+                dpg.add_spacer(width=10)
+                rt = dpg.add_text("", tag="lbl_rec_time")
+                if font_mono:
+                    dpg.bind_item_font(rt, font_mono)
+                dpg.bind_item_theme(rt, _txt_theme(_t("accent_red")))
+                dpg.add_spacer(width=10)
+                dpg.add_text("", tag="lbl_rec_samples")
+
+            dpg.add_spacer(height=2)
+
+            # Visualisation header
+            with dpg.group(horizontal=True):
+                dpg.add_text("VISUALISATION")
+                dpg.add_spacer(width=10)
+                td = dpg.add_text(
+                    f"Planche {BOARD_WIDTH_MM}x{BOARD_HEIGHT_MM} mm")
+                dpg.bind_item_theme(td, _txt_theme(_t("text_dim")))
+                dpg.add_spacer(width=30)
+                tc = dpg.add_text("X: 0.0 mm  Y: 0.0 mm",
+                                  tag="label_coords")
+                dpg.bind_item_theme(tc, _txt_theme(_t("accent_teal")))
+                if font_coords:
+                    dpg.bind_item_font(tc, font_coords)
+
+            dpg.add_spacer(height=4)
+
+            # Drawlist (initial size, resized each frame)
+            dpg.add_drawlist(width=800, height=500, tag="board_drawlist")
+
+# ── Modal dialogs ────────────────────────────────────────────
+with dpg.window(modal=True, show=False, tag="add_user_modal",
+                label="Nouvel utilisateur", width=300, height=100,
+                no_resize=True):
+    dpg.add_input_text(tag="add_user_input", hint="Nom...", width=-1,
+                       on_enter=True, callback=_do_add_user)
+    with dpg.group(horizontal=True):
+        dpg.add_button(label="OK", callback=_do_add_user, width=120)
+        dpg.add_button(label="Annuler", width=120,
+                       callback=lambda s, a, u: dpg.configure_item(
+                           "add_user_modal", show=False))
+
+with dpg.window(modal=True, show=False, tag="add_plat_modal",
+                label="Nouvelle plateforme", width=300, height=100,
+                no_resize=True):
+    dpg.add_input_text(tag="add_plat_input", hint="Nom...", width=-1,
+                       on_enter=True, callback=_do_add_plat)
+    with dpg.group(horizontal=True):
+        dpg.add_button(label="OK", callback=_do_add_plat, width=120)
+        dpg.add_button(label="Annuler", width=120,
+                       callback=lambda s, a, u: dpg.configure_item(
+                           "add_plat_modal", show=False))
+
+with dpg.window(modal=True, show=False, tag="del_confirm_modal",
+                label="Confirmer suppression", width=350, height=120,
+                no_resize=True):
+    dpg.add_text("", tag="del_confirm_text", wrap=320)
+    dpg.add_spacer(height=8)
+    with dpg.group(horizontal=True):
+        dpg.add_button(label="Supprimer", tag="del_confirm_ok",
+                       callback=_do_delete_confirmed, width=140)
+        dpg.add_button(label="Annuler", width=140,
+                       callback=lambda s, a, u: dpg.configure_item(
+                           "del_confirm_modal", show=False))
+
+# ============================================================
+# ACCENT COLOR APPLICATION
+# ============================================================
+def _apply_accent_colors():
+    dpg.bind_item_theme("title_text", _txt_theme(_t("accent_blue")))
+    dpg.bind_item_theme("label_coords", _txt_theme(_t("accent_teal")))
+    dpg.bind_item_theme("label_total", _txt_theme(_t("accent_blue")))
+    dpg.bind_item_theme("lbl_rec_time", _txt_theme(_t("accent_red")))
+    dpg.bind_item_theme("btn_connect",
+                        _btn_theme(_t("btn_connect_bg"), _t("btn_connect_hv")))
+    for i in range(4):
+        dpg.bind_item_theme(f"sensor_name_{i}", _txt_theme(_sc(i)))
+        dpg.bind_item_theme(f"bar_{i}", _bar_theme(_sc(i)))
+        dpg.bind_item_theme(f"calib_lbl_{i}", _txt_theme(_sc(i)))
+        dpg.bind_item_theme(f"btn_cal_{i}",
+                            _btn_theme(_t("cal_bg"), _t("cal_hover"), _sc(i)))
+
+_apply_accent_colors()
+
+# ============================================================
+# BOARD DRAWING
+# ============================================================
+def _force_board_redraw():
+    _board["last_size"] = (0, 0)
+
+def _create_dynamic_items():
+    """Create trail dots + cross once (moved each frame)."""
+    b = _board
+    dl = "board_drawlist"
+    b["trail_ids"] = []
+    for i in range(TRAIL_LENGTH):
+        tid = dpg.draw_circle(center=(0, 0), radius=2, fill=(0, 0, 0, 0),
+                              color=(0, 0, 0, 0), parent=dl, show=False)
+        b["trail_ids"].append(tid)
+    b["cross_ids"] = {
+        "h": dpg.draw_line(p1=(0, 0), p2=(0, 0), color=_t("cross_color"),
+                           thickness=2, parent=dl),
+        "v": dpg.draw_line(p1=(0, 0), p2=(0, 0), color=_t("cross_color"),
+                           thickness=2, parent=dl),
+        "txt": dpg.draw_text(pos=(0, 0), text="CoM", color=_t("com_color"),
+                             size=16, parent=dl),
+    }
+
+def _draw_static_board():
+    """Draw grid, outline, sensors, labels."""
+    b = _board
+    dl = "board_drawlist"
+    left, right = b["left"], b["right"]
+    top, bottom = b["top"], b["bottom"]
+    cx, cy      = b["cx"], b["cy"]
+    bw, bh      = right - left, bottom - top
+
+    # Board fill
+    dpg.draw_rectangle(pmin=(left, top), pmax=(right, bottom),
+                       fill=_t("board_fill"), color=(0, 0, 0, 0), parent=dl)
+    # Grid
+    gc = _t("grid_color")
+    n_cols = BOARD_WIDTH_MM // 5
+    n_rows = BOARD_HEIGHT_MM // 5
+    sx, sy = bw / n_cols, bh / n_rows
+    for i in range(1, n_cols):
+        gx = left + i * sx
+        dpg.draw_line((gx, top), (gx, bottom), color=gc, parent=dl)
+    for i in range(1, n_rows):
+        gy = top + i * sy
+        dpg.draw_line((left, gy), (right, gy), color=gc, parent=dl)
+
+    # Center dashes
+    oc = _t("board_outline")
+    dpg.draw_line((cx, top), (cx, bottom), color=oc, thickness=1, parent=dl)
+    dpg.draw_line((left, cy), (right, cy), color=oc, thickness=1, parent=dl)
+
+    # Outline
+    dpg.draw_rectangle(pmin=(left, top), pmax=(right, bottom),
+                       color=oc, thickness=2, parent=dl)
+
+    # Center mark
+    dim = _t("text_dim")
+    dpg.draw_line((cx - 6, cy), (cx + 6, cy), color=dim, parent=dl)
+    dpg.draw_line((cx, cy - 6), (cx, cy + 6), color=dim, parent=dl)
+
+    # Sensor circles: 0=HD, 1=HG, 2=BD, 3=BG
+    corners = [(right, top), (left, top), (right, bottom), (left, bottom)]
+    tp = _t("text_primary")
+    b["sensor_val_ids"] = []
+    for idx, (sx, sy) in enumerate(corners):
+        sc = _sc(idx)
+        dpg.draw_circle(center=(sx, sy), radius=CAP_R, fill=sc, color=tp,
+                        thickness=1, parent=dl)
+        # kg values: placed clearly outside circles
+        is_right = idx % 2 == 0   # 0=HD, 2=BD are right side
+        is_top   = idx < 2        # 0=HD, 1=HG are top
+        if is_right:
+            kx = sx - 75  # text ends before the circle (left of it)
+        else:
+            kx = sx + CAP_R + 8  # text starts after the circle (right of it)
+        if is_top:
+            ky = sy - CAP_R - 22  # above the circle
+        else:
+            ky = sy + CAP_R + 6   # below the circle
+        vid = dpg.draw_text(pos=(kx, ky),
+                            text="0.00 kg", color=sc, size=18, parent=dl)
+        b["sensor_val_ids"].append(vid)
+        # Sensor number: centered in circle (approx char width=8, height=14 at size 14)
+        dpg.draw_text(pos=(sx - 4, sy - 8), text=str(idx + 1),
+                      color=(255, 255, 255, 255), size=14, parent=dl)
+
+    # Dimension labels
+    dpg.draw_text(pos=(cx - 70, bottom + 30),
+                  text="Gauche              Droite", color=dim,
+                  size=14, parent=dl)
+    dpg.draw_text(pos=(left - 50, cy - 35),
+                  text="Haut\n  |\n  |\nBas", color=dim, size=13, parent=dl)
+    dpg.draw_text(pos=(cx - 20, top - 42),
+                  text=f"{BOARD_WIDTH_MM} mm", color=dim, size=13, parent=dl)
+    dpg.draw_text(pos=(right + 14, cy - 12),
+                  text=f"{BOARD_HEIGHT_MM}\nmm", color=dim, size=13, parent=dl)
+
+def _update_board_size():
+    """Check if drawlist needs resizing; recalculate geometry."""
+    b = _board
+    try:
+        rp_w, rp_h = dpg.get_item_rect_size("right_panel")
+    except Exception:
+        return False
+    dl_w = max(200, int(rp_w) - 16)
+    dl_h = max(200, int(rp_h) - 95)
+    if dl_w < 200 or dl_h < 200:
+        return False
+    if (dl_w, dl_h) == b["last_size"]:
+        return False
+    b["last_size"] = (dl_w, dl_h)
+    dpg.configure_item("board_drawlist", width=dl_w, height=dl_h)
+
+    avail_w = dl_w - 2 * MARGIN
+    avail_h = dl_h - 2 * MARGIN
+    if avail_w <= 0 or avail_h <= 0:
+        return False
     if avail_w / avail_h > BOARD_RATIO:
         board_h = avail_h
         board_w = board_h * BOARD_RATIO
     else:
         board_w = avail_w
         board_h = board_w / BOARD_RATIO
+    ccx, ccy = dl_w / 2, dl_h / 2
+    b["left"]   = ccx - board_w / 2
+    b["right"]  = ccx + board_w / 2
+    b["top"]    = ccy - board_h / 2
+    b["bottom"] = ccy + board_h / 2
+    b["cx"], b["cy"] = ccx, ccy
 
-    cx_canvas = cw / 2
-    cy_canvas = ch / 2
-    board_left   = cx_canvas - board_w / 2
-    board_right  = cx_canvas + board_w / 2
-    board_top    = cy_canvas - board_h / 2
-    board_bottom = cy_canvas + board_h / 2
-    board_cx     = cx_canvas
-    board_cy     = cy_canvas
-
-    canvas.create_rectangle(board_left, board_top, board_right, board_bottom,
-                            fill=BOARD_FILL, outline="", tags="board_static")
-
-    n_cols = BOARD_WIDTH_CM // 5
-    n_rows = BOARD_HEIGHT_CM // 5
-    step_x = board_w / n_cols
-    step_y = board_h / n_rows
-    for i in range(1, n_cols):
-        gx = board_left + i * step_x
-        canvas.create_line(gx, board_top, gx, board_bottom,
-                           fill=GRID_COLOR, tags="board_static")
-    for i in range(1, n_rows):
-        gy = board_top + i * step_y
-        canvas.create_line(board_left, gy, board_right, gy,
-                           fill=GRID_COLOR, tags="board_static")
-
-    canvas.create_line(board_cx, board_top, board_cx, board_bottom,
-                       fill=BOARD_OUTLINE, dash=(6, 4), tags="board_static")
-    canvas.create_line(board_left, board_cy, board_right, board_cy,
-                       fill=BOARD_OUTLINE, dash=(6, 4), tags="board_static")
-
-    canvas.create_rectangle(board_left, board_top, board_right, board_bottom,
-                            outline=BOARD_OUTLINE, width=2, tags="board_static")
-
-    canvas.create_line(board_cx - 6, board_cy, board_cx + 6, board_cy,
-                       fill=TEXT_DIM, tags="board_static")
-    canvas.create_line(board_cx, board_cy - 6, board_cx, board_cy + 6,
-                       fill=TEXT_DIM, tags="board_static")
-
-    # 0=Haut-Droit, 1=Haut-Gauche, 2=Bas-Droit, 3=Bas-Gauche
-    corners = [(board_right, board_top),  (board_left, board_top),
-               (board_right, board_bottom), (board_left, board_bottom)]
-    for idx, (cx, cy) in enumerate(corners):
-        canvas.create_oval(cx - CAP_R, cy - CAP_R, cx + CAP_R, cy + CAP_R,
-                           fill=SENSOR_COLORS[idx], outline=TEXT_PRIMARY, width=1,
-                           tags="board_static")
-        tx_off = -28 if idx % 2 == 0 else 28
-        ty_off = -18 if idx < 2 else 18
-        txt = canvas.create_text(cx + tx_off, cy + ty_off, text="0.00 kg",
-                                 fill=SENSOR_COLORS[idx], font=("Consolas", 9),
-                                 tags="board_static")
-        sensor_val_texts.append(txt)
-        canvas.create_text(cx, cy, text=str(idx + 1), fill="white",
-                           font=("Segoe UI", 9, "bold"), tags="board_static")
-
-    canvas.create_text(board_cx, board_bottom + 22,
-                       text="Gauche                    Droite",
-                       fill=TEXT_DIM, font=("Segoe UI", 9), tags="board_static")
-    canvas.create_text(board_left - 28, board_cy,
-                       text="Haut\n|\n|\nBas",
-                       fill=TEXT_DIM, font=("Segoe UI", 8),
-                       justify="center", tags="board_static")
-    canvas.create_text(board_cx, board_top - 14,
-                       text=f"{BOARD_WIDTH_CM} cm",
-                       fill=TEXT_DIM, font=("Segoe UI", 8), tags="board_static")
-    canvas.create_text(board_right + 22, board_cy,
-                       text=f"{BOARD_HEIGHT_CM}\ncm",
-                       fill=TEXT_DIM, font=("Segoe UI", 8),
-                       justify="center", tags="board_static")
-
-    canvas.tag_raise(com_h_line)
-    canvas.tag_raise(com_v_line)
-    canvas.tag_raise(com_label)
-
-canvas.bind("<Configure>", draw_board)
+    dpg.delete_item("board_drawlist", children_only=True)
+    _draw_static_board()
+    _create_dynamic_items()
+    return True
 
 # ============================================================
-# TOGGLE THEME
+# PROCESS RESPONSES
 # ============================================================
-def toggle_theme():
-    global current_theme, _last_board_size
-    old_name = current_theme
-    current_theme = "light" if current_theme == "dark" else "dark"
-
-    # Color map old -> new
-    cmap = _build_color_map(old_name, current_theme)
-
-    # Update module-level color vars
-    _sync_colors()
-
-    # Recursive retheme on all tk widgets
-    _retheme_widgets(root, cmap)
-
-    # ttk combobox style
-    _update_ttk_style()
-    _update_notebook_style()
-
-    # Canvas dynamic items
-    canvas.itemconfig(com_h_line, fill=CROSS_COLOR)
-    canvas.itemconfig(com_v_line, fill=CROSS_COLOR)
-    canvas.itemconfig(com_label, fill=COM_COLOR)
-
-    # Bar fill colors (sensor colors)
-    for i in range(4):
-        bar_canvases[i].itemconfig(weight_bars[i], fill=SENSOR_COLORS[i])
-
-    # Force board redraw (recreates all board_static items with new colors)
-    _last_board_size = (0, 0)
-    draw_board()
-
-    # Toggle button text
-    btn_theme.config(text=("\u2600" if current_theme == "dark" else "\u263e"))
-
-    # Save preference
-    _save_settings({"theme": current_theme})
-
-btn_theme.config(command=toggle_theme)
-
-# ============================================================
-# PROCESS REPONSES
-# ============================================================
-def process_responses():
+def _process_responses():
     with resp_lock:
         responses = list(response_queue)
         response_queue.clear()
     for data in responses:
         status = data.get("status", "")
         if status == "tare_ok":
-            label_cal_log.config(text="Tare effectuee", fg=ACCENT_GREEN)
+            dpg.set_value("label_cal_log", "Tare effectuee")
         elif status == "cal_ok":
             s  = data["sensor"] - 1
             sc, off = data["scale"], data["offset"]
             calib_scales[s]  = sc
             calib_offsets[s] = off
-            cal_buttons[s].config(text=f"CAL {s+1}  {SENSOR_NAMES[s]}",
-                                  fg=SENSOR_COLORS[s])
-            calib_display_labels[s].config(text=f"C{s+1}: off={off}  sc={sc:.4f}")
-            label_cal_log.config(
-                text=f"Capteur {s+1} calibre\nScale={sc:.4f}", fg=ACCENT_GREEN)
+            dpg.set_item_label(f"btn_cal_{s}",
+                               f"CAL {s+1}  {SENSOR_NAMES[s]}")
+            dpg.set_value(f"calib_lbl_{s}",
+                          f"C{s+1}: off={off}  sc={sc:.4f}")
+            dpg.set_value("label_cal_log",
+                          f"Capteur {s+1} calibre  Scale={sc:.4f}")
         elif status == "cal_error":
-            label_cal_log.config(text=f"{data.get('msg','erreur')}", fg=ACCENT_RED)
-            for i in range(4):
-                cal_buttons[i].config(text=f"CAL {i+1}  {SENSOR_NAMES[i]}",
-                                      fg=SENSOR_COLORS[i])
+            dpg.set_value("label_cal_log", data.get("msg", "erreur"))
         elif status == "calib_values":
             for i in range(4):
                 off = data.get(f"off{i+1}", 0)
-                sc  = data.get(f"sc{i+1}",  0.0)
+                sc  = data.get(f"sc{i+1}", 0.0)
                 calib_offsets[i] = off
                 calib_scales[i]  = sc
-                calib_display_labels[i].config(
-                    text=f"C{i+1}: off={off}  sc={sc:.4f}")
-            label_cal_log.config(text="Valeurs recuperees", fg=ACCENT_GREEN)
+                dpg.set_value(f"calib_lbl_{i}",
+                              f"C{i+1}: off={off}  sc={sc:.4f}")
+            dpg.set_value("label_cal_log", "Valeurs recuperees")
 
 # ============================================================
-# UPDATE UI (~60 fps)
+# FRAME UPDATE  (called every frame — GPU vsync)
 # ============================================================
-def update_ui():
-    global freq, com_trail
+def _frame_update():
+    global _update_ready_flag, _prev_status, _prev_total, _prev_freq_str
 
-    process_responses()
+    _process_responses()
+    _update_board_size()
 
     weight = list(raw_w)
     total  = sum(weight)
+    total_gt = total >= 1000
 
+    # Weights + bars (conditional updates)
+    sv_ids = _board.get("sensor_val_ids")
     for i in range(4):
-        weight_labels[i].config(text=f"{weight[i]/1000:.3f} kg")
-        bar_cv    = bar_canvases[i]
-        bar_width = bar_cv.winfo_width() or 1
-        fill_w    = (weight[i] / max(total, 1)) * bar_width if total > 1 else 0
-        bar_cv.coords(weight_bars[i], 0, 0, fill_w, 4)
-    if sensor_val_texts:
-        for i in range(4):
-            canvas.itemconfig(sensor_val_texts[i],
-                              text=f"{weight[i]/1000:.2f} kg")
+        if _prev_weights[i] != weight[i]:
+            _prev_weights[i] = weight[i]
+            w_str = f"{weight[i]/1000:.2f} kg"
+            dpg.set_value(f"weight_{i}", w_str)
+            if sv_ids:
+                dpg.configure_item(sv_ids[i], text=w_str)
+        bar_val = (weight[i] / max(total, 1)) if total_gt and weight[i] >= 1000 else 0
+        dpg.set_value(f"bar_{i}", bar_val)
 
-    label_total.config(text=f"{total/1000:.3f} kg")
-    label_freq.config(text=f"{freq:.1f} Hz")
+    if _prev_total != total:
+        _prev_total = total
+        dpg.set_value("label_total", f"{total/1000:.2f} kg")
+    f_str = f"{freq:.0f} Hz"
+    if f_str != _prev_freq_str:
+        _prev_freq_str = f_str
+        dpg.set_value("label_freq", f_str)
 
-    if all(w < NEAR_ZERO_THRESHOLD for w in weight) or total <= 1:
-        x_pos, y_pos, x_pct, y_pct = board_cx, board_cy, 0.0, 0.0
+    # Center of mass
+    b = _board
+    if not total_gt:
+        x_pos, y_pos = b["cx"], b["cy"]
+        x_mm, y_mm = 0.0, 0.0
+        xr, yr = 0.0, 0.0
     else:
-        xr    = (weight[0]+weight[2]-weight[1]-weight[3]) / total
-        yr    = (weight[2]+weight[3]-weight[0]-weight[1]) / total
-        x_pos = max(board_left, min(board_right,
-                    board_cx + xr*(board_right-board_left)/2))
-        y_pos = max(board_top, min(board_bottom,
-                    board_cy + yr*(board_bottom-board_top)/2))
-        x_pct, y_pct = xr*100, yr*100
+        xr = (weight[0]+weight[2]-weight[1]-weight[3]) / total
+        yr = (weight[2]+weight[3]-weight[0]-weight[1]) / total
+        half_w = (b["right"] - b["left"]) / 2
+        half_h = (b["bottom"] - b["top"]) / 2
+        x_pos = max(b["left"], min(b["right"], b["cx"] + xr * half_w))
+        y_pos = max(b["top"], min(b["bottom"], b["cy"] + yr * half_h))
+        x_mm = xr * BOARD_WIDTH_MM / 2
+        y_mm = yr * BOARD_HEIGHT_MM / 2
 
-    label_coords.config(text=f"X: {x_pct:+.1f}%   Y: {y_pct:+.1f}%")
+    dpg.set_value("label_coords", f"X: {x_mm:+.1f} mm   Y: {y_mm:+.1f} mm")
 
-    # ── Recording ────────────────────────────────────────────
+    # Recording
     if recorder.is_recording:
         t_ms = int((time.time() - recorder.start_time) * 1000)
         recorder.record(t_ms, weight[0], weight[1], weight[2], weight[3],
-                        x_pct / 100.0, y_pct / 100.0)
+                        xr, yr)
         elapsed = recorder.elapsed
         mins = int(elapsed // 60)
         secs = elapsed % 60
-        lbl_rec_time.config(text=f"{mins:02d}:{secs:05.2f}")
-        lbl_rec_samples.config(text=f"{recorder.sample_count} samples",
-                               fg=TEXT_SECONDARY)
+        dpg.set_value("lbl_rec_time", f"{mins:02d}:{secs:05.2f}")
+        dpg.set_value("lbl_rec_samples", f"{recorder.sample_count} samples")
 
-    # Trail (couleurs adaptees au theme)
+    # Trail (pre-computed colors/sizes from _trail_colors/_trail_sizes)
     com_trail.append((x_pos, y_pos))
-    if len(com_trail) > TRAIL_LENGTH:
-        com_trail = com_trail[-TRAIL_LENGTH:]
-    for item in trail_items:
-        canvas.delete(item)
-    trail_items.clear()
+    trail_ids = b["trail_ids"]
+    if trail_ids:
+        n_trail = len(com_trail) - 1
+        for idx in range(TRAIL_LENGTH):
+            tid = trail_ids[idx]
+            if idx < n_trail:
+                tx, ty = com_trail[idx]
+                c = _trail_colors[idx]
+                dpg.configure_item(tid, center=(tx, ty),
+                                   radius=_trail_sizes[idx],
+                                   fill=c, color=c, show=True)
+            else:
+                dpg.configure_item(tid, show=False)
 
-    bg_rgb    = _hex_to_rgb(BG_CANVAS)
-    cross_rgb = _hex_to_rgb(CROSS_COLOR)
-    for idx, (tx, ty) in enumerate(com_trail[:-1]):
-        alpha = idx / TRAIL_LENGTH
-        r = int(bg_rgb[0] + (cross_rgb[0] - bg_rgb[0]) * alpha)
-        g = int(bg_rgb[1] + (cross_rgb[1] - bg_rgb[1]) * alpha)
-        b = int(bg_rgb[2] + (cross_rgb[2] - bg_rgb[2]) * alpha)
-        sz = 1.5 + alpha * 3
-        trail_items.append(canvas.create_oval(
-            tx - sz, ty - sz, tx + sz, ty + sz,
-            fill=f"#{r:02x}{g:02x}{b:02x}", outline=""))
+    # Cross
+    if b["cross_ids"]:
+        cc = _t("cross_color")
+        dpg.configure_item(b["cross_ids"]["h"],
+                           p1=(x_pos - CROSS_SIZE, y_pos),
+                           p2=(x_pos + CROSS_SIZE, y_pos), color=cc)
+        dpg.configure_item(b["cross_ids"]["v"],
+                           p1=(x_pos, y_pos - CROSS_SIZE),
+                           p2=(x_pos, y_pos + CROSS_SIZE), color=cc)
+        dpg.configure_item(b["cross_ids"]["txt"],
+                           pos=(x_pos - 10, y_pos - CROSS_SIZE - 16),
+                           color=_t("com_color"))
 
-    # Croix du centre de masse
-    canvas.coords(com_h_line, x_pos - CROSS_SIZE, y_pos,
-                  x_pos + CROSS_SIZE, y_pos)
-    canvas.coords(com_v_line, x_pos, y_pos - CROSS_SIZE,
-                  x_pos, y_pos + CROSS_SIZE)
-    canvas.coords(com_label, x_pos, y_pos - CROSS_SIZE - 10)
-    canvas.tag_raise(com_h_line)
-    canvas.tag_raise(com_v_line)
-    canvas.tag_raise(com_label)
-
-    # Status connexion
-    elapsed = time.time() - last_received
+    # Status
+    elapsed_t = time.time() - last_received
     is_connected = False
     if serial_conn is None:
-        label_status.config(text="DECONNECTE", fg=ACCENT_RED)
-    elif elapsed < 2:
-        label_status.config(text="CONNECTE",   fg=ACCENT_GREEN)
+        st = ("DECONNECTE", "accent_red")
+    elif elapsed_t < 2:
+        st = ("CONNECTE", "accent_green")
         is_connected = True
-    elif elapsed < 5:
-        label_status.config(text="ATTENTE...",  fg=ACCENT_AMBER)
+    elif elapsed_t < 5:
+        st = ("ATTENTE...", "accent_amber")
     else:
-        label_status.config(text="TIMEOUT",     fg=ACCENT_RED)
+        st = ("TIMEOUT", "accent_red")
 
-    # Update remote sync state (silent, no UI)
-    remote_sync.update_state(
-        is_recording=recorder.is_recording,
-        connected=is_connected)
+    if st != _prev_status:
+        _prev_status = st
+        dpg.set_value("label_status", st[0])
+        dpg.bind_item_theme("label_status", _txt_theme(_t(st[1])))
 
-    root.after(16, update_ui)
+    remote_sync.update_state(is_recording=recorder.is_recording,
+                             connected=is_connected)
 
-def _on_close():
-    """Clean shutdown: stop recording, remote sync, close serial."""
-    global serial_conn
-    if recorder.is_recording:
-        recorder.stop()
-    if remote_sync.is_running:
-        remote_sync.stop()
-    if serial_conn:
-        try:
-            serial_conn.close()
-        except Exception:
-            pass
-        serial_conn = None
-    root.destroy()
+    # Remote update
+    if _update_ready_flag:
+        _update_ready_flag = False
+        dpg.set_value("label_conn_info",
+                      "Mise a jour telechargee — redemarrer l'app")
 
-root.protocol("WM_DELETE_WINDOW", _on_close)
+# ============================================================
+# VIEWPORT + MAIN LOOP
+# ============================================================
+_icon_path = None
+for _p in ([os.path.join(getattr(sys, '_MEIPASS', ''), 'icon.ico')] if getattr(sys, 'frozen', False) else []) + \
+          [os.path.join(_app_dir(), 'icon.ico')]:
+    if os.path.isfile(_p):
+        _icon_path = _p
+        break
 
-update_ui()
-root.mainloop()
+dpg.create_viewport(title="Centre de Masse -- Plateforme de Force",
+                    width=1280, height=800,
+                    small_icon=_icon_path or "",
+                    large_icon=_icon_path or "")
+dpg.setup_dearpygui()
+dpg.show_viewport()
+dpg.set_primary_window("main_window", True)
+dpg.maximize_viewport()
+
+_refresh_users()
+_refresh_platforms()
+_refresh_ports()
+
+def _on_update_ready():
+    global _update_ready_flag
+    _update_ready_flag = True
+
+remote_sync.on_update_ready = _on_update_ready
+remote_sync.start()
+
+# Main render loop — runs at GPU vsync (60-144+ fps)
+while dpg.is_dearpygui_running():
+    _frame_update()
+    dpg.render_dearpygui_frame()
+
+# ── Clean shutdown ───────────────────────────────────────────
+if recorder.is_recording:
+    recorder.stop()
+if remote_sync.is_running:
+    remote_sync.stop()
+if serial_conn:
+    try:
+        serial_conn.close()
+    except Exception:
+        pass
+dpg.destroy_context()

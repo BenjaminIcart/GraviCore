@@ -7,7 +7,7 @@ import os
 import database as db
 
 try:
-    from flask import Flask, render_template, jsonify, request
+    from flask import Flask, render_template, jsonify, request, Response
 except ImportError:
     print("[WEB] Flask not installed. Run: pip install flask")
     Flask = None
@@ -94,6 +94,86 @@ def _create_app():
     @app.route("/api/users")
     def api_users():
         return jsonify(db.list_users())
+
+    # ── Export endpoints ──────────────────────────────────────
+
+    def _format_timecode(t_ms):
+        total_s = t_ms / 1000.0
+        h = int(total_s // 3600)
+        m = int((total_s % 3600) // 60)
+        s = total_s % 60
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+    @app.route("/api/session/<int:session_id>/export/csv")
+    def api_export_csv(session_id):
+        session = db.get_session(session_id)
+        if session is None:
+            return jsonify({"error": "not found"}), 404
+        samples = db.get_samples(session_id)
+        if not samples:
+            return jsonify({"error": "no samples"}), 404
+
+        import io, csv
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter=";")
+        buf.write(f"# Session #{session_id}\n")
+        buf.write(f"# Utilisateur: {session.get('user_name', '?')}\n")
+        buf.write(f"# Plateforme: {session.get('platform_name', '?')}\n")
+        buf.write(f"# Date: {session.get('started_at', '')}\n")
+        buf.write(f"# Duree: {session.get('duration_sec', 0):.1f}s\n")
+        buf.write(f"# Samples: {len(samples)}\n")
+        writer.writerow(["timecode", "t_ms", "t_sec",
+                         "w0_g", "w1_g", "w2_g", "w3_g", "total_g",
+                         "com_x", "com_y"])
+        for t_ms, w0, w1, w2, w3, cx, cy in samples:
+            total = w0 + w1 + w2 + w3
+            writer.writerow([
+                _format_timecode(t_ms), t_ms, round(t_ms / 1000.0, 3),
+                round(w0, 1), round(w1, 1), round(w2, 1), round(w3, 1),
+                round(total, 1), round(cx, 6), round(cy, 6),
+            ])
+
+        return Response(
+            buf.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition":
+                      f"attachment; filename=session_{session_id}.csv"})
+
+    @app.route("/api/session/<int:session_id>/export/txt")
+    def api_export_txt(session_id):
+        session = db.get_session(session_id)
+        if session is None:
+            return jsonify({"error": "not found"}), 404
+        samples = db.get_samples(session_id)
+        if not samples:
+            return jsonify({"error": "no samples"}), 404
+
+        lines = []
+        lines.append(f"Session #{session_id}")
+        lines.append(f"Utilisateur: {session.get('user_name', '?')}")
+        lines.append(f"Plateforme: {session.get('platform_name', '?')}")
+        lines.append(f"Date: {session.get('started_at', '')}")
+        lines.append(f"Duree: {session.get('duration_sec', 0):.1f}s")
+        lines.append(f"Samples: {len(samples)}")
+        lines.append("-" * 90)
+        header = ["timecode", "t_ms", "t_sec",
+                   "w0_g", "w1_g", "w2_g", "w3_g", "total_g",
+                   "com_x", "com_y"]
+        lines.append("\t".join(header))
+        lines.append("-" * 90)
+        for t_ms, w0, w1, w2, w3, cx, cy in samples:
+            total = w0 + w1 + w2 + w3
+            lines.append("\t".join(str(v) for v in [
+                _format_timecode(t_ms), t_ms, round(t_ms / 1000.0, 3),
+                round(w0, 1), round(w1, 1), round(w2, 1), round(w3, 1),
+                round(total, 1), round(cx, 6), round(cy, 6),
+            ]))
+
+        return Response(
+            "\n".join(lines),
+            mimetype="text/plain",
+            headers={"Content-Disposition":
+                      f"attachment; filename=session_{session_id}.txt"})
 
     return app
 

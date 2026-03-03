@@ -2,8 +2,88 @@
 #  replay_window.py — Session browser + replay viewer
 # ============================================================
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import csv
+import io
+import os
 import database as db
+
+
+# ── Export helpers ────────────────────────────────────────────
+
+def _format_timecode(t_ms: int) -> str:
+    """Convert milliseconds to HH:MM:SS.mmm timecode string."""
+    total_s = t_ms / 1000.0
+    h = int(total_s // 3600)
+    m = int((total_s % 3600) // 60)
+    s = total_s % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _build_export_rows(session_id: int):
+    """Return (session_info, header, rows) for export."""
+    session = db.get_session(session_id)
+    samples = db.get_samples(session_id)
+    if not session or not samples:
+        return None, None, None
+
+    header = [
+        "timecode", "t_ms", "t_sec",
+        "w0_g", "w1_g", "w2_g", "w3_g", "total_g",
+        "com_x", "com_y"
+    ]
+
+    rows = []
+    for t_ms, w0, w1, w2, w3, cx, cy in samples:
+        total = w0 + w1 + w2 + w3
+        rows.append([
+            _format_timecode(t_ms),
+            t_ms,
+            round(t_ms / 1000.0, 3),
+            round(w0, 1), round(w1, 1), round(w2, 1), round(w3, 1),
+            round(total, 1),
+            round(cx, 6), round(cy, 6),
+        ])
+    return session, header, rows
+
+
+def export_session_csv(session_id: int, filepath: str):
+    """Export a session to CSV file."""
+    session, header, rows = _build_export_rows(session_id)
+    if rows is None:
+        return False
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        # Metadata comment lines
+        f.write(f"# Session #{session_id}\n")
+        f.write(f"# Utilisateur: {session.get('user_name', '?')}\n")
+        f.write(f"# Plateforme: {session.get('platform_name', '?')}\n")
+        f.write(f"# Date: {session.get('started_at', '')}\n")
+        f.write(f"# Duree: {session.get('duration_sec', 0):.1f}s\n")
+        f.write(f"# Samples: {len(rows)}\n")
+        writer.writerow(header)
+        writer.writerows(rows)
+    return True
+
+
+def export_session_txt(session_id: int, filepath: str):
+    """Export a session to tab-separated TXT file."""
+    session, header, rows = _build_export_rows(session_id)
+    if rows is None:
+        return False
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"Session #{session_id}\n")
+        f.write(f"Utilisateur: {session.get('user_name', '?')}\n")
+        f.write(f"Plateforme: {session.get('platform_name', '?')}\n")
+        f.write(f"Date: {session.get('started_at', '')}\n")
+        f.write(f"Duree: {session.get('duration_sec', 0):.1f}s\n")
+        f.write(f"Samples: {len(rows)}\n")
+        f.write("-" * 90 + "\n")
+        f.write("\t".join(header) + "\n")
+        f.write("-" * 90 + "\n")
+        for row in rows:
+            f.write("\t".join(str(v) for v in row) + "\n")
+    return True
 
 
 class SessionBrowser(tk.Toplevel):
@@ -105,6 +185,20 @@ class SessionBrowser(tk.Toplevel):
                                command=self._delete_session)
         btn_delete.pack(side="right")
 
+        btn_export_txt = tk.Button(bbar, text="EXPORT TXT", font=("Segoe UI", 10, "bold"),
+                                    fg=t["text_primary"], bg=t["accent_teal"],
+                                    activebackground=t["accent_blue"],
+                                    relief="flat", cursor="hand2", padx=14, pady=6,
+                                    command=lambda: self._export_session("txt"))
+        btn_export_txt.pack(side="left", padx=(8, 4))
+
+        btn_export_csv = tk.Button(bbar, text="EXPORT CSV", font=("Segoe UI", 10, "bold"),
+                                    fg=t["text_primary"], bg=t["accent_teal"],
+                                    activebackground=t["accent_blue"],
+                                    relief="flat", cursor="hand2", padx=14, pady=6,
+                                    command=lambda: self._export_session("csv"))
+        btn_export_csv.pack(side="left", padx=(0, 4))
+
     def _refresh_filters(self):
         users = db.list_users()
         self._users_map = {u[1]: u[0] for u in users}
@@ -155,6 +249,32 @@ class SessionBrowser(tk.Toplevel):
         if sid is None:
             return
         ReplayViewer(self, sid, self._themes, self._current_theme)
+
+    def _export_session(self, fmt: str):
+        sid = self._get_selected_id()
+        if sid is None:
+            messagebox.showwarning("Export", "Selectionnez une session.", parent=self)
+            return
+        if fmt == "csv":
+            filepath = filedialog.asksaveasfilename(
+                parent=self, title="Exporter en CSV",
+                defaultextension=".csv",
+                initialfile=f"session_{sid}.csv",
+                filetypes=[("CSV (point-virgule)", "*.csv"), ("Tous", "*.*")])
+        else:
+            filepath = filedialog.asksaveasfilename(
+                parent=self, title="Exporter en TXT",
+                defaultextension=".txt",
+                initialfile=f"session_{sid}.txt",
+                filetypes=[("Fichier texte", "*.txt"), ("Tous", "*.*")])
+        if not filepath:
+            return
+        ok = export_session_csv(sid, filepath) if fmt == "csv" else export_session_txt(sid, filepath)
+        if ok:
+            messagebox.showinfo("Export", f"Session #{sid} exportee :\n{filepath}",
+                                parent=self)
+        else:
+            messagebox.showerror("Erreur", "Aucun echantillon a exporter.", parent=self)
 
     def _delete_session(self):
         sid = self._get_selected_id()
@@ -340,6 +460,21 @@ class ReplayViewer(tk.Toplevel):
                           relief="flat", cursor="hand2", padx=6,
                           command=lambda s=spd: self._set_speed(s))
             b.pack(side="left", padx=2)
+
+        # Export buttons
+        btn_csv = tk.Button(ctrl, text="CSV", font=("Segoe UI", 9),
+                            fg=t["text_secondary"], bg=t["tare_bg"],
+                            activebackground=t["tare_hover"],
+                            relief="flat", cursor="hand2", padx=6,
+                            command=lambda: self._export("csv"))
+        btn_csv.pack(side="left", padx=(12, 2))
+
+        btn_txt = tk.Button(ctrl, text="TXT", font=("Segoe UI", 9),
+                            fg=t["text_secondary"], bg=t["tare_bg"],
+                            activebackground=t["tare_hover"],
+                            relief="flat", cursor="hand2", padx=6,
+                            command=lambda: self._export("txt"))
+        btn_txt.pack(side="left", padx=2)
 
         # Slider
         self._slider_var = tk.IntVar(value=0)
@@ -548,6 +683,29 @@ class ReplayViewer(tk.Toplevel):
         if not self._playing:
             self._trail = []
             self._show_frame(int(val))
+
+    def _export(self, fmt: str):
+        sid = self._session_id
+        if fmt == "csv":
+            filepath = filedialog.asksaveasfilename(
+                parent=self, title="Exporter en CSV",
+                defaultextension=".csv",
+                initialfile=f"session_{sid}.csv",
+                filetypes=[("CSV (point-virgule)", "*.csv"), ("Tous", "*.*")])
+        else:
+            filepath = filedialog.asksaveasfilename(
+                parent=self, title="Exporter en TXT",
+                defaultextension=".txt",
+                initialfile=f"session_{sid}.txt",
+                filetypes=[("Fichier texte", "*.txt"), ("Tous", "*.*")])
+        if not filepath:
+            return
+        ok = export_session_csv(sid, filepath) if fmt == "csv" else export_session_txt(sid, filepath)
+        if ok:
+            messagebox.showinfo("Export", f"Session #{sid} exportee :\n{filepath}",
+                                parent=self)
+        else:
+            messagebox.showerror("Erreur", "Aucun echantillon a exporter.", parent=self)
 
     def destroy(self):
         self._playing = False
